@@ -74,6 +74,13 @@ Nothing is written until **every** file has been downloaded and vetted: it must 
 
 If the script lives in a git checkout, `git pull` is the better move and `--update` will say so.
 
+A copy installed before `--update` existed can't use it to get it, and a copy too broken to run can't heal itself. Bootstrap either case once:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/faratech/agent-session-sync/main/agent-session-sync.py \
+  -o /path/to/agent-session-sync.py && chmod +x /path/to/agent-session-sync.py
+```
+
 Both are **idempotent and surgical**. Entries are matched on the *script filename* in the command (and, for crontab comments, on the tool name) — never on a bare substring, since this repo's own directory is called `agent-session-sync` and every path to `memory-sync.py` therefore contains it. So `--install` twice is a no-op, an entry you wrote by hand is recognised rather than duplicated, uninstalling one script never disturbs the other, and your unrelated cron jobs and hooks are left byte-for-byte alone.
 
 `settings.json` is backed up before it's rewritten, and if it isn't valid JSON the installer refuses to touch it. `--uninstall` never deletes synced sessions or memory files — it only removes the automation.
