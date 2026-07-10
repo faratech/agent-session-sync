@@ -60,6 +60,20 @@ To remove them again:
 
 Use `--no-cron` or `--no-hooks` to do just one half. `--memories` is symmetric: it applies to whichever of `--install` / `--uninstall` you pass, so a plain `--uninstall` leaves the memory companion running.
 
+## Updating
+
+```sh
+./agent-session-sync.py --update --dry-run   # show what would change
+./agent-session-sync.py --update             # fetch from GitHub, then --install
+./agent-session-sync.py --update --ref v1.2  # a branch, tag or commit
+```
+
+Pulls the latest scripts straight from this repo and re-runs the installer, which is idempotent — so it adds only what's missing and leaves the rest alone. `memory-sync.py` comes along if it's already installed next to the script; pass `--memories` to fetch it for the first time.
+
+Nothing is written until **every** file has been downloaded and vetted: it must carry a shebang, identify itself in its docstring, end with its entry point, and compile. That last pair matters more than it looks — the first few KB of either script is valid Python on its own, so a truncated download would install cleanly and then silently do nothing on every cron tick. The old copy is kept as `.bak`, and the replacement is atomic, so a cron tick landing mid-update runs one version or the other, never a half-written file.
+
+If the script lives in a git checkout, `git pull` is the better move and `--update` will say so.
+
 Both are **idempotent and surgical**. Entries are matched on the *script filename* in the command (and, for crontab comments, on the tool name) — never on a bare substring, since this repo's own directory is called `agent-session-sync` and every path to `memory-sync.py` therefore contains it. So `--install` twice is a no-op, an entry you wrote by hand is recognised rather than duplicated, uninstalling one script never disturbs the other, and your unrelated cron jobs and hooks are left byte-for-byte alone.
 
 `settings.json` is backed up before it's rewritten, and if it isn't valid JSON the installer refuses to touch it. `--uninstall` never deletes synced sessions or memory files — it only removes the automation.

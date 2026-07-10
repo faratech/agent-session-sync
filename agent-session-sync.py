@@ -39,6 +39,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 
@@ -870,6 +872,104 @@ def uninstall_hooks(dry, spec):
     return True
 
 
+# ---- self-update -----------------------------------------------------------
+
+RAW_BASE = "https://raw.githubusercontent.com/faratech/agent-session-sync"
+
+
+ENTRY_POINT = b"sys.exit(main())"
+
+
+def _fetch(url, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent": f"{TOOL_NAME}-updater"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    declared = resp.headers.get("Content-Length")
+    if declared is not None and len(data) != int(declared):
+        raise OSError(f"short read: got {len(data)} of {declared} bytes")
+    return data
+
+
+def _vet(source, filename):
+    """Refuse anything that isn't the whole script we asked for. A proxy, a login
+    page, or a truncated body must never land on disk as an executable we then run.
+
+    Truncation is the subtle one: the first few KB of either script is still valid
+    Python, so it compiles, installs, and then silently does nothing on every cron
+    tick. Hence the tail check — not just the head.
+    """
+    if not source.startswith(b"#!"):
+        return "no shebang — not a script"
+    stem = os.path.basename(filename).rsplit(".", 1)[0]
+    if b'"""' + stem.encode() not in source:
+        return f"docstring does not identify it as {stem}"
+    if not source.rstrip().endswith(ENTRY_POINT):
+        return "truncated — does not end with the entry point"
+    try:
+        compile(source.decode("utf-8"), filename, "exec")
+    except (SyntaxError, UnicodeDecodeError) as e:
+        return f"does not compile: {e}"
+    return None
+
+
+def _install_file(path, source, dry):
+    """Replace `path` with `source`, atomically, keeping a .bak. Returns True if changed."""
+    if os.path.exists(path) and sha256_file(path) == hashlib.sha256(source).hexdigest():
+        print(f"update: {os.path.basename(path)} already up to date")
+        return False
+    if dry:
+        _say(True, f"update: replace {path} ({len(source)} bytes)")
+        return True
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".bak")
+    tmp = path + ".new"
+    with open(tmp, "wb") as fh:
+        fh.write(source)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, path)   # atomic: a concurrent cron tick sees one version or the other
+    print(f"update: {os.path.basename(path)} updated (previous saved as .bak)")
+    return True
+
+
+def do_update(args):
+    here = os.path.dirname(script_path())
+    if os.path.isdir(os.path.join(here, ".git")):
+        print(f"note: {here} is a git checkout — `git pull` is the better move there.\n")
+
+    wanted = [script_path()]
+    mem = os.path.join(here, MEMORY_SCRIPT)
+    if args.memories or os.path.exists(mem):
+        wanted.append(mem)
+
+    print(f"{TOOL_NAME}: updating from {RAW_BASE} @ {args.ref}\n")
+    fetched = []
+    for path in wanted:                       # fetch and vet everything before writing anything
+        name = os.path.basename(path)
+        url = f"{RAW_BASE}/{args.ref}/{name}"
+        try:
+            source = _fetch(url)
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+            print(f"update failed: cannot fetch {url}: {e}", file=sys.stderr)
+            return 1
+        bad = _vet(source, name)
+        if bad:
+            print(f"update failed: {url}: {bad}", file=sys.stderr)
+            return 1
+        fetched.append((path, source))
+
+    changed = False
+    for path, source in fetched:
+        changed |= _install_file(path, source, args.dry_run)
+
+    if args.dry_run:
+        print("\n(dry run — nothing was written)")
+        return 0
+    if changed:
+        print("\nThe new code takes effect on the next run; this process is still the old one.")
+    print()
+    return do_install(args)                   # idempotent: adds only what is missing
+
+
 # ---- drivers ---------------------------------------------------------------
 
 def _specs(args):
@@ -952,8 +1052,12 @@ def main():
                       help="add the scheduler entry and Claude Code hooks if absent")
     mode.add_argument("--uninstall", action="store_true",
                       help="remove them if present (synced sessions are kept)")
+    mode.add_argument("--update", action="store_true",
+                      help="fetch the latest scripts from GitHub, then --install")
+    setup.add_argument("--ref", default="main", metavar="REF",
+                       help="branch, tag or commit to update from (default: main)")
     setup.add_argument("--memories", action="store_true",
-                       help="also un/install the opt-in memory-sync.py companion")
+                       help="also un/install/update the opt-in memory-sync.py companion")
     setup.add_argument("--no-cron", action="store_true", help="skip the scheduler entry")
     setup.add_argument("--no-hooks", action="store_true", help="skip the Claude Code hooks")
     setup.add_argument("--purge", action="store_true",
@@ -961,13 +1065,17 @@ def main():
     args = ap.parse_args()
     VERBOSE = args.verbose
 
+    if args.update:
+        return do_update(args)
     if args.install:
         return do_install(args)
     if args.uninstall:
         return do_uninstall(args)
     if args.purge or args.no_cron or args.no_hooks or args.memories:
         ap.error("--memories/--purge/--no-cron/--no-hooks only apply to "
-                 "--install or --uninstall")
+                 "--install, --uninstall or --update")
+    if args.ref != "main":
+        ap.error("--ref only applies to --update")
 
     args.since_epoch = datetime.now(timezone.utc).timestamp() - args.days * 86400
 
