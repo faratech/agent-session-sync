@@ -2,7 +2,7 @@
 
 Bidirectional conversation sync between [OpenAI Codex CLI](https://github.com/openai/codex) and [Claude Code](https://claude.com/claude-code).
 
-Start a conversation in one, resume it in the other. A single Python file, no dependencies.
+Start a conversation in one, resume it in the other. A single Python file, no dependencies. An opt-in companion, [`memory-sync.py`](#memory-sync-opt-in-companion), does the same for each agent's long-term memory.
 
 ```
 ~/.codex/sessions/2026/07/09/rollout-*.jsonl   <->   ~/.claude/projects/<munged-cwd>/<uuid>.jsonl
@@ -60,6 +60,35 @@ To remove them again:
 Both are **idempotent and surgical**. They only touch crontab lines and hook objects whose command names this tool, so running `--install` twice is a no-op, an entry you wrote by hand is recognised rather than duplicated, and your other cron jobs and hooks are left byte-for-byte alone. `settings.json` is backed up before it's rewritten, and if it isn't valid JSON the installer refuses to touch it. `--uninstall` never deletes synced sessions — it only removes the automation.
 
 Use `--no-cron` or `--no-hooks` to install just one half.
+
+## Memory sync (opt-in companion)
+
+`memory-sync.py` syncs the notes each agent keeps *about you*, rather than conversations:
+
+```
+$CODEX_HOME/memories/memory_summary.md  <->  <claude projects>/*/memory/*.md
+```
+
+It's a separate script on purpose. Session transcripts are inert until you resume one; memory files get injected into **every** future session. That's a higher-trust write, so it stays off unless you ask for it, and it runs behind its own lock and state:
+
+```sh
+./memory-sync.py --dry-run -v                  # preview
+./agent-session-sync.py --install --memories   # add its cron entry + Stop hook
+```
+
+It writes exactly two files, both of which it owns and stamps with a generated-by marker:
+
+- `<claude projects>/<your home project>/memory/codex_memory_sync.md`
+- `$CODEX_HOME/memories/claude_code_sync.md`
+
+plus one idempotent pointer line in each side's index — Claude's `MEMORY.md` and Codex's global `AGENTS.md`. Everything else is read-only. Codex's own `MEMORY.md`, `memory_summary.md` and `raw_memories.md` are never written, and if something *without* the marker is sitting at an owned path, it is reported and left alone rather than overwritten.
+
+Two things to know before you turn it on:
+
+- **Your Claude memories become Codex context.** The `AGENTS.md` pointer tells Codex to read the bundle at session start, so anything in your Claude memory files goes to your Codex model provider. Read the bundle once before you trust it with secrets.
+- **It costs context.** The bundle is every memory file from every project, concatenated. `memory-sync.py` warns above 64 KB (`--warn-bytes`); a 160 KB bundle is roughly 40k tokens on every Codex session.
+
+Codex → Claude no-ops unless `memory_summary.md` exists. Recent Codex keeps memory in `memories_*.sqlite`, which this script does not read.
 
 If you'd rather wire it up yourself, the equivalents are:
 
