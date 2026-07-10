@@ -111,9 +111,10 @@ It's a separate script on purpose. Session transcripts are inert until you resum
 ```
 --to-claude       only sync codex -> claude
 --to-codex        only sync claude -> codex
+--mode MODE       auto (default) | full | index — what to hand Codex
 --project <name>  Claude project dir to receive Codex memory
                   (default: the one matching your home dir)
---warn-bytes N    warn when the bundle Codex must read exceeds N (default 65536)
+--warn-bytes N    size at which auto switches to an index (default 65536)
 --dry-run -v      show what would happen
 --quiet           silent when idle (for cron)
 ```
@@ -127,8 +128,10 @@ plus one idempotent pointer line in each side's index — Claude's `MEMORY.md` a
 
 Two things to know before you turn it on:
 
-- **Your Claude memories become Codex context.** The `AGENTS.md` pointer tells Codex to read the bundle at session start, so anything in your Claude memory files goes to your Codex model provider. Read the bundle once before you trust it with secrets.
-- **It costs context.** The bundle is every memory file from every project, concatenated, and Codex re-reads it every session. Past `--warn-bytes` (64 KB by default, roughly 16k tokens) the bundle is still written but **the pointer is not added** — wiring a session to an enormous file is worse than not wiring it. Prune your memory files, or accept the cost explicitly with `--warn-bytes N`. An existing pointer is never revoked; that call was yours.
+- **Your Claude memories become Codex context.** The `AGENTS.md` pointer tells Codex to read the bundle, so anything in your Claude memory files can reach your Codex model provider. Read the bundle once before you trust it with secrets.
+- **The bundle is full text only while it fits.** Past `--warn-bytes` (64 KB), `--mode auto` writes an **index** instead: one line per memory file with its description and absolute path, for Codex to read on demand. On a real host that turned 324 files and 1.1 MB into 47 KB — 24× smaller — with nothing lost, since the paths are right there.
+
+Only `AGENTS.md` itself is injected into a session; the pointer is one line of it. The bundle costs nothing until the model acts on that line and reads the file, and Codex truncates tool output — so pointing at a megabyte doesn't blow the context window, it just wastes a turn on an arbitrary slice. Hence the index. `--mode full` forces the old behaviour and will refuse to add a pointer to an oversized bundle; an existing pointer is never revoked.
 
 Codex → Claude no-ops unless `memory_summary.md` exists. Recent Codex keeps memory in `memories_*.sqlite`, which this script does not read.
 

@@ -19,6 +19,12 @@ Everything else is read-only. Codex's own MEMORY.md, memory_summary.md and
 raw_memories.md are never written. A file that exists at an owned path but
 lacks our generated-by marker is left alone and reported, never clobbered.
 
+The Claude -> Codex bundle is full memory text while that fits under
+--warn-bytes, and otherwise an index: one line per memory file with its
+description and absolute path, for Codex to read on demand. The pointer only
+ever costs a line of AGENTS.md; pointing it at a megabyte would just spend a
+turn on a truncated slice of it.
+
 Codex -> Claude no-ops unless memory_summary.md exists; recent Codex keeps
 memory in memories_*.sqlite instead, and this script does not read it.
 
@@ -59,6 +65,7 @@ INDEX_LINE = (f"- [{CLAUDE_OWNED_NAME}]({CLAUDE_OWNED_NAME}) — Auto-synced Cod
 
 # never read into the Claude -> Codex bundle
 SKIP_NAMES = {CLAUDE_OWNED_NAME, "MEMORY.md"}
+DESC_CAP = 100          # chars of description kept per file in index mode
 
 VERBOSE = False
 
@@ -238,54 +245,107 @@ def codex_to_claude(state, args):
     return 1
 
 
-def claude_to_codex(state, args):
-    chunks = []
+def describe(text):
+    """One line about a memory file: its frontmatter description, else its first prose line."""
+    if text.startswith("---"):
+        m = re.search(r"^description:\s*(.+)$", text, re.M)
+        if m:
+            return " ".join(m.group(1).split())[:DESC_CAP]
+    for line in text.split("\n"):
+        s = line.strip()
+        if s and not s.startswith(("---", "#")):
+            return " ".join(s.split())[:DESC_CAP]
+    return ""
+
+
+def memory_groups():
+    out = []
     for project, memdir in memory_dirs():
         files = [f for f in sorted(os.listdir(memdir))
                  if f.endswith(".md") and f not in SKIP_NAMES]
-        if not files:
-            continue
+        if files:
+            out.append((project, memdir, files))
+    return out
+
+
+def build_full(groups):
+    chunks = []
+    for project, memdir, files in groups:
         chunks.append(f"## project: {project}")
         for name in files:
             chunks.append(f"### {name}")
             chunks.append(strip_frontmatter(read(os.path.join(memdir, name))).strip())
             chunks.append("")
-    if not chunks:
+    return "\n".join(chunks).rstrip() + "\n"
+
+
+def build_index(groups):
+    """A table of contents with absolute paths. Codex reads only what it needs."""
+    chunks = []
+    for project, memdir, files in groups:
+        chunks.append(f"## project: {project}  ({memdir})")
+        for name in files:
+            chunks.append(f"- {name} — {describe(read(os.path.join(memdir, name)))}")
+        chunks.append("")
+    return "\n".join(chunks).rstrip() + "\n"
+
+
+def claude_to_codex(state, args):
+    groups = memory_groups()
+    if not groups:
         log("claude->codex: no memory files, nothing to do")
         return 0
+    n_files = sum(len(f) for _, _, f in groups)
 
-    body_core = "\n".join(chunks).rstrip() + "\n"
-    digest = sha(body_core)          # timestamp excluded, so an idle run is a no-op
+    # Full text when it fits; otherwise an index, because telling Codex to read a
+    # megabyte just burns a turn on a truncated slice of it.
+    mode = args.mode
+    full = build_full(groups)
+    if mode == "auto":
+        mode = "full" if len(full.encode("utf-8")) <= args.warn_bytes else "index"
+    if mode == "full":
+        body_core = full
+        note = f"{n_files} files, full text"
+    else:
+        body_core = build_index(groups)
+        note = (f"{n_files} files across {len(groups)} projects, index only — "
+                f"read a path above for its full text")
+
+    digest = sha(mode + body_core)   # timestamp excluded, so an idle run is a no-op
     if state.get("claude_memory_sha") == digest:
         log("claude->codex: unchanged")
         return 0
 
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     body = (f"# Claude Code Memory\n{MARKER}\nupdated: {stamp}\n"
-            f"scope: Auto-synced from Claude Code memory files on this host\n\n{body_core}")
+            f"scope: Auto-synced from Claude Code memory files on this host\n"
+            f"mode: {note}\n\n{body_core}")
     if not write_owned(CODEX_OWNED, body, args.dry_run, state):
         return 0
 
-    # The pointer is what makes Codex read the bundle on every session. Wiring it
-    # to something enormous is worse than not wiring it at all, so an oversized
-    # bundle gets written but not pointed at. An existing pointer is left alone —
-    # that was your call to make, not ours to revoke.
+    # The pointer costs one line of AGENTS.md; the bundle only reaches the model if
+    # it acts on that line and reads the file. Pointing at something huge therefore
+    # doesn't blow the context window — it wastes a turn on a slice of the file,
+    # since Codex truncates tool output. Only reachable via --mode full: auto
+    # already downgrades to an index. An existing pointer is left alone.
     size = len(body.encode("utf-8"))
     oversized = size > args.warn_bytes
     already = "claude_code_sync" in read(CODEX_AGENTS)
     if oversized and not already:
         print(f"not pointing {os.path.basename(CODEX_AGENTS)} at a {size // 1024}K bundle "
-              f"(~{size // 4000}k tokens, read on every Codex session). Prune your memory "
-              f"files, or accept it with --warn-bytes {size}.", file=sys.stderr)
+              f"(~{size // 4000}k tokens): Codex would be told to read it, and truncate it. "
+              f"Use --mode index, or accept it with --warn-bytes {size}.", file=sys.stderr)
         added = False
     else:
         if oversized:
-            print(f"warning: {CODEX_OWNED} is {size // 1024}K (~{size // 4000}k tokens) "
-                  f"and Codex is told to read it every session.", file=sys.stderr)
+            print(f"warning: {CODEX_OWNED} is {size // 1024}K (~{size // 4000}k tokens); "
+                  f"a Codex session told to read it will get a truncated slice.",
+                  file=sys.stderr)
         added = append_once(CODEX_AGENTS, "claude_code_sync", POINTER, args.dry_run)
     if not args.dry_run:
         state["claude_memory_sha"] = digest
-    print(f"{'would sync' if args.dry_run else 'synced'} claude->codex: {CODEX_OWNED}"
+    print(f"{'would sync' if args.dry_run else 'synced'} claude->codex: {CODEX_OWNED} "
+          f"[{mode}, {size // 1024}K]"
           + (f" (+ pointer in {os.path.basename(CODEX_AGENTS)})" if added else ""))
     return 1
 
@@ -298,6 +358,10 @@ def main():
     ap.add_argument("--to-codex", action="store_true", help="only sync claude -> codex")
     ap.add_argument("--project", help="Claude project dir to receive Codex memory "
                                       "(default: the one matching your home dir)")
+    ap.add_argument("--mode", choices=("auto", "full", "index"), default="auto",
+                    help="what to hand Codex: full memory text, or an index of names, "
+                         "descriptions and paths. auto (default) picks full when it fits "
+                         "under --warn-bytes, else index")
     ap.add_argument("--warn-bytes", type=int, default=65536,
                     help="warn when the bundle Codex must read exceeds this size "
                          "(default 65536; it costs context on every session)")
