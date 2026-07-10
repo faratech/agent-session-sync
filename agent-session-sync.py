@@ -874,7 +874,10 @@ def uninstall_hooks(dry, spec):
 
 # ---- self-update -----------------------------------------------------------
 
-RAW_BASE = "https://raw.githubusercontent.com/faratech/agent-session-sync"
+REPO = "faratech/agent-session-sync"
+RAW_BASE = f"https://raw.githubusercontent.com/{REPO}"
+API_BASE = f"https://api.github.com/repos/{REPO}"
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 ENTRY_POINT = b"sys.exit(main())"
@@ -888,6 +891,30 @@ def _fetch(url, timeout=30):
     if declared is not None and len(data) != int(declared):
         raise OSError(f"short read: got {len(data)} of {declared} bytes")
     return data
+
+
+def resolve_ref(ref):
+    """Branch or tag -> immutable commit sha.
+
+    raw.githubusercontent serves branch URLs with `cache-control: max-age=300`,
+    and neither no-cache headers nor a cache-busting query string move it. So a
+    fetch of `main` can hand back a five-minute-old file and we would cheerfully
+    report "already up to date" while being behind. Commit-pinned raw URLs are
+    immutable, so resolve first and fetch that.
+    """
+    if SHA_RE.match(ref):
+        return ref
+    try:
+        data = json.loads(_fetch(f"{API_BASE}/commits/{ref}", timeout=15))
+        sha = data.get("sha", "")
+        if SHA_RE.match(sha):
+            return sha
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError,
+            json.JSONDecodeError, KeyError):
+        pass
+    print(f"note: could not resolve {ref} to a commit; fetching the branch directly, "
+          f"which GitHub may serve up to 5 minutes stale.\n", file=sys.stderr)
+    return ref
 
 
 def _vet(source, filename):
@@ -966,11 +993,13 @@ def do_update(args):
     if args.memories or os.path.exists(mem):
         wanted.append(mem)
 
-    print(f"{TOOL_NAME}: updating from {RAW_BASE} @ {args.ref}\n")
+    rev = resolve_ref(args.ref)
+    shown = args.ref if rev == args.ref else f"{args.ref} ({rev[:8]})"
+    print(f"{TOOL_NAME}: updating from {REPO} @ {shown}\n")
     fetched = []
     for path in wanted:                       # fetch and vet everything before writing anything
         name = os.path.basename(path)
-        url = f"{RAW_BASE}/{args.ref}/{name}"
+        url = f"{RAW_BASE}/{rev}/{name}"
         try:
             source = _fetch(url)
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
