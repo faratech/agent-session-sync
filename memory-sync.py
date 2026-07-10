@@ -256,6 +256,7 @@ def describe(text):
         m = re.search(r"^description:\s*(.+)$", text, re.M)
         if m:
             return _tidy(m.group(1))
+        text = strip_frontmatter(text)   # else `name:` etc. would masquerade as prose
     for line in text.split("\n"):
         s = line.strip()
         if s and not s.startswith(("---", "#")):
