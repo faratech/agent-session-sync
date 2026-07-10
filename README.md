@@ -16,13 +16,25 @@ You hit a usage limit in one tool. Or you want a second model's read on a thread
 
 ## Install
 
-Requires Python 3.8+. No packages to install.
+Requires Python 3.8+ and nothing else. Standard library only — no packages, and no `git`, `curl`, `requests` or `httpx`, including for `--update`, which speaks HTTPS through `urllib`.
 
 ```sh
 git clone https://github.com/faratech/agent-session-sync
 cd agent-session-sync
 ./agent-session-sync.py --dry-run -v      # preview, writes nothing
 ./agent-session-sync.py                   # sync both directions, last 30 days
+```
+
+No `git`? Grab the two files with the Python you already have:
+
+```sh
+python3 - <<'PY'
+import os, urllib.request
+base = "https://raw.githubusercontent.com/faratech/agent-session-sync/main/"
+for f in ("agent-session-sync.py", "memory-sync.py"):
+    urllib.request.urlretrieve(base + f, f)
+    os.chmod(f, 0o755)
+PY
 ```
 
 An idle run costs about 100 ms — it stats source files and skips anything unchanged — so it's cheap to run on a short timer.
@@ -76,12 +88,18 @@ Nothing is written until **every** file has been downloaded and vetted: it must 
 
 If the script lives in a git checkout, `git pull` is the better move and `--update` will say so.
 
-A copy installed before `--update` existed can't use it to get it, and a copy too broken to run can't heal itself. Bootstrap either case once:
+A copy installed before `--update` existed can't use it to get it, and a copy too broken to run can't heal itself. Bootstrap either case once — with `curl`, or with nothing but Python:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/faratech/agent-session-sync/main/agent-session-sync.py \
   -o /path/to/agent-session-sync.py && chmod +x /path/to/agent-session-sync.py
 ```
+
+```sh
+python3 -c 'import os,urllib.request as u; p="/path/to/agent-session-sync.py"; u.urlretrieve("https://raw.githubusercontent.com/faratech/agent-session-sync/main/agent-session-sync.py", p); os.chmod(p, 0o755)'
+```
+
+Bootstrapping from `main` can be served up to five minutes stale (see above). If you're chasing a commit you just pushed, put its SHA in the URL instead of `main` — those are immutable.
 
 Both are **idempotent and surgical**. Entries are matched on the *script filename* in the command (and, for crontab comments, on the tool name) — never on a bare substring, since this repo's own directory is called `agent-session-sync` and every path to `memory-sync.py` therefore contains it. So `--install` twice is a no-op, an entry you wrote by hand is recognised rather than duplicated, uninstalling one script never disturbs the other, and your unrelated cron jobs and hooks are left byte-for-byte alone.
 
