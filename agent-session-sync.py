@@ -958,26 +958,65 @@ def _install_file(path, source, dry):
     return True
 
 
-def _git_origin(path):
+def find_git_repo(start):
+    """(worktree root, git dir) for the repo containing `start`, else (None, None).
+
+    Read off the filesystem rather than shelled out to `git`: updating must work
+    on a box that has no git installed, and silently skipping the warning there
+    is exactly the case where it matters most.
+    """
+    path = os.path.abspath(start)
+    while True:
+        dot = os.path.join(path, ".git")
+        if os.path.isdir(dot):
+            return path, dot
+        if os.path.isfile(dot):                     # worktree or submodule pointer
+            try:
+                with open(dot, encoding="utf-8", errors="replace") as fh:
+                    line = fh.read().strip()
+            except OSError:
+                return None, None
+            if line.startswith("gitdir:"):
+                gitdir = os.path.normpath(
+                    os.path.join(path, line.split(":", 1)[1].strip()))
+                return path, gitdir
+            return None, None
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None, None
+        path = parent
+
+
+def git_origin_url(gitdir):
+    """The origin URL from .git/config, without invoking git."""
+    config = os.path.join(gitdir, "config")
+    if not os.path.exists(config):
+        # a linked worktree keeps its config in the main repo
+        commondir = os.path.join(gitdir, "commondir")
+        if os.path.exists(commondir):
+            try:
+                with open(commondir, encoding="utf-8", errors="replace") as fh:
+                    gitdir = os.path.normpath(os.path.join(gitdir, fh.read().strip()))
+            except OSError:
+                return ""
+            config = os.path.join(gitdir, "config")
     try:
-        p = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"],
-                           capture_output=True, text=True, timeout=5)
-        return p.stdout.strip() if p.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError):
+        with open(config, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
         return ""
+    section = re.search(r'^\[remote "origin"\](.*?)(?=^\[|\Z)', text, re.S | re.M)
+    if not section:
+        return ""
+    url = re.search(r"^\s*url\s*=\s*(.+)$", section.group(1), re.M)
+    return url.group(1).strip() if url else ""
 
 
 def do_update(args):
     here = os.path.dirname(script_path())
-    toplevel = ""
-    try:
-        p = subprocess.run(["git", "-C", here, "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, timeout=5)
-        toplevel = p.stdout.strip() if p.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError):
-        pass
+    toplevel, gitdir = find_git_repo(here)
     if toplevel:
-        origin = _git_origin(toplevel)
+        origin = git_origin_url(gitdir)
         if TOOL_NAME in origin:
             print(f"note: {toplevel} is a checkout of this repo — "
                   f"`git pull` is the better move there.\n")
