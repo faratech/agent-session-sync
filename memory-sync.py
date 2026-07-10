@@ -245,16 +245,21 @@ def codex_to_claude(state, args):
     return 1
 
 
+def _tidy(s):
+    s = " ".join(s.split()).strip().strip('"').strip("'").strip()
+    return s if len(s) <= DESC_CAP else s[:DESC_CAP].rsplit(" ", 1)[0] + "…"
+
+
 def describe(text):
     """One line about a memory file: its frontmatter description, else its first prose line."""
     if text.startswith("---"):
         m = re.search(r"^description:\s*(.+)$", text, re.M)
         if m:
-            return " ".join(m.group(1).split())[:DESC_CAP]
+            return _tidy(m.group(1))
     for line in text.split("\n"):
         s = line.strip()
         if s and not s.startswith(("---", "#")):
-            return " ".join(s.split())[:DESC_CAP]
+            return _tidy(s)
     return ""
 
 
