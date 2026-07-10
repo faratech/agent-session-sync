@@ -908,14 +908,15 @@ def do_install(args):
 
 def do_uninstall(args):
     dry = args.dry_run
+    specs = _specs(args)
     print(f"{TOOL_NAME}: uninstalling\n")
-    for spec in _specs(args):
+    for spec in specs:
         if not args.no_cron:
             uninstall_cron(dry, spec)
         if not args.no_hooks:
             uninstall_hooks(dry, spec)
     if args.purge:
-        for path in (STATE_DIR, LOG_FILE):
+        for path in [STATE_DIR] + [s["log"] for s in specs]:
             if not os.path.exists(path):
                 continue
             _say(dry, f"purge: remove {path}")
