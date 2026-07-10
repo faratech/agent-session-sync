@@ -931,10 +931,35 @@ def _install_file(path, source, dry):
     return True
 
 
+def _git_origin(path):
+    try:
+        p = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"],
+                           capture_output=True, text=True, timeout=5)
+        return p.stdout.strip() if p.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def do_update(args):
     here = os.path.dirname(script_path())
-    if os.path.isdir(os.path.join(here, ".git")):
-        print(f"note: {here} is a git checkout — `git pull` is the better move there.\n")
+    toplevel = ""
+    try:
+        p = subprocess.run(["git", "-C", here, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=5)
+        toplevel = p.stdout.strip() if p.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if toplevel:
+        origin = _git_origin(toplevel)
+        if TOOL_NAME in origin:
+            print(f"note: {toplevel} is a checkout of this repo — "
+                  f"`git pull` is the better move there.\n")
+        else:
+            # Someone else's repo. Writing here dirties their tree, and a deploy
+            # that runs `git checkout .` will silently revert us.
+            print(f"note: {here} lives inside an unrelated git repo "
+                  f"({origin or toplevel}). Updating will show up in its git status, "
+                  f"and a hard reset there would revert this script.\n")
 
     wanted = [script_path()]
     mem = os.path.join(here, MEMORY_SCRIPT)
