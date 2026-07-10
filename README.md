@@ -128,7 +128,7 @@ plus one idempotent pointer line in each side's index — Claude's `MEMORY.md` a
 Two things to know before you turn it on:
 
 - **Your Claude memories become Codex context.** The `AGENTS.md` pointer tells Codex to read the bundle at session start, so anything in your Claude memory files goes to your Codex model provider. Read the bundle once before you trust it with secrets.
-- **It costs context.** The bundle is every memory file from every project, concatenated. `memory-sync.py` warns above 64 KB (`--warn-bytes`); a 160 KB bundle is roughly 40k tokens on every Codex session.
+- **It costs context.** The bundle is every memory file from every project, concatenated, and Codex re-reads it every session. Past `--warn-bytes` (64 KB by default, roughly 16k tokens) the bundle is still written but **the pointer is not added** — wiring a session to an enormous file is worse than not wiring it. Prune your memory files, or accept the cost explicitly with `--warn-bytes N`. An existing pointer is never revoked; that call was yours.
 
 Codex → Claude no-ops unless `memory_summary.md` exists. Recent Codex keeps memory in `memories_*.sqlite`, which this script does not read.
 

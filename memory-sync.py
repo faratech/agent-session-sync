@@ -250,14 +250,26 @@ def claude_to_codex(state, args):
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     body = (f"# Claude Code Memory\n{MARKER}\nupdated: {stamp}\n"
             f"scope: Auto-synced from Claude Code memory files on this host\n\n{body_core}")
-    size = len(body.encode("utf-8"))
-    if size > args.warn_bytes:
-        print(f"warning: {CODEX_OWNED} is {size // 1024}K (~{size // 4000}k tokens). "
-              f"Codex is told to read it every session — consider pruning your memory "
-              f"files or raising --warn-bytes to silence this.", file=sys.stderr)
     if not write_owned(CODEX_OWNED, body, args.dry_run):
         return 0
-    added = append_once(CODEX_AGENTS, "claude_code_sync", POINTER, args.dry_run)
+
+    # The pointer is what makes Codex read the bundle on every session. Wiring it
+    # to something enormous is worse than not wiring it at all, so an oversized
+    # bundle gets written but not pointed at. An existing pointer is left alone —
+    # that was your call to make, not ours to revoke.
+    size = len(body.encode("utf-8"))
+    oversized = size > args.warn_bytes
+    already = "claude_code_sync" in read(CODEX_AGENTS)
+    if oversized and not already:
+        print(f"not pointing {os.path.basename(CODEX_AGENTS)} at a {size // 1024}K bundle "
+              f"(~{size // 4000}k tokens, read on every Codex session). Prune your memory "
+              f"files, or accept it with --warn-bytes {size}.", file=sys.stderr)
+        added = False
+    else:
+        if oversized:
+            print(f"warning: {CODEX_OWNED} is {size // 1024}K (~{size // 4000}k tokens) "
+                  f"and Codex is told to read it every session.", file=sys.stderr)
+        added = append_once(CODEX_AGENTS, "claude_code_sync", POINTER, args.dry_run)
     if not args.dry_run:
         state["claude_memory_sha"] = digest
     print(f"{'would sync' if args.dry_run else 'synced'} claude->codex: {CODEX_OWNED}"
