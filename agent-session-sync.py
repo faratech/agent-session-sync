@@ -35,6 +35,9 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -67,9 +70,18 @@ def default_state_dir():
     return os.path.join(xdg, "agent-session-sync")
 
 
+def default_log_file():
+    if os.name != "nt" and getattr(os, "geteuid", lambda: 1)() == 0:
+        return "/var/log/agent-session-sync.log"
+    return os.path.join(default_state_dir(), "sync.log")
+
+
 STATE_DIR = default_state_dir()
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 LOCK_FILE = os.path.join(STATE_DIR, "lock")
+LOG_FILE = default_log_file()
+CLAUDE_SETTINGS = os.path.join(CLAUDE_HOME, "settings.json")
+TOOL_NAME = "agent-session-sync"  # also the marker matched when un/installing
 
 CLAUDE_VERSION = "2.1.206"  # stamped into generated records; display-only
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$")
@@ -578,6 +590,287 @@ def sync_claude_to_codex(state, args, guard):
 
 
 # ---------------------------------------------------------------------------
+# install / uninstall
+#
+# Both are idempotent and additive: they only ever touch lines and JSON objects
+# that name this tool, so a hand-rolled entry is recognised (never duplicated)
+# and unrelated cron jobs / hooks are left exactly as they were.
+# ---------------------------------------------------------------------------
+
+CRON_SCHEDULE = "*/2 * * * *"
+CRON_COMMENT = (f"# {TOOL_NAME} — bidirectional Codex <-> Claude Code session sync "
+                f"(idempotent, ~100ms when idle)")
+HOOK_EVENTS = ("SessionStart", "Stop")
+
+
+def script_path():
+    return os.path.realpath(os.path.abspath(__file__))
+
+
+def _pythonw():
+    """On Windows prefer pythonw.exe so the scheduled task never flashes a console."""
+    exe = sys.executable
+    if os.name == "nt":
+        cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(cand):
+            return cand
+    return exe
+
+
+def hook_command():
+    if os.name == "nt":
+        return f'"{_pythonw()}" "{script_path()}" --quiet'
+    return f"{shlex.quote(sys.executable)} {shlex.quote(script_path())} --quiet"
+
+
+def cron_command():
+    return f"{hook_command()} >> {shlex.quote(LOG_FILE)} 2>&1"
+
+
+def is_ours(text):
+    return TOOL_NAME in str(text)
+
+
+def _say(dry, msg):
+    print(("would " if dry else "") + msg)
+
+
+# ---- scheduler: cron (POSIX) ----------------------------------------------
+
+def _crontab_read():
+    p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    return p.stdout.splitlines() if p.returncode == 0 else []
+
+
+def _crontab_write(lines):
+    body = "\n".join(lines).rstrip("\n") + "\n"
+    subprocess.run(["crontab", "-"], input=body, text=True, check=True)
+
+
+def _ensure_log():
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        open(LOG_FILE, "a").close()
+    except OSError as e:
+        print(f"scheduler: could not create {LOG_FILE} ({e}); cron will still run")
+
+
+def install_cron(dry):
+    if os.name == "nt":
+        return install_task(dry)
+    if not shutil.which("crontab"):
+        print("scheduler: no `crontab` on PATH — skipped (install a scheduler yourself)")
+        return False
+    lines = _crontab_read()
+    if any(is_ours(l) for l in lines):
+        print("scheduler: cron entry already present")
+        return False
+    entry = f"{CRON_SCHEDULE} {cron_command()}"
+    if dry:
+        _say(True, f"scheduler: add cron entry:\n    {entry}")
+        return True
+    _ensure_log()
+    _crontab_write(lines + ["", CRON_COMMENT, entry])
+    print(f"scheduler: cron entry added ({CRON_SCHEDULE}), logging to {LOG_FILE}")
+    return True
+
+
+def uninstall_cron(dry):
+    if os.name == "nt":
+        return uninstall_task(dry)
+    if not shutil.which("crontab"):
+        return False
+    lines = _crontab_read()
+    keep = [l for l in lines if not is_ours(l)]
+    if len(keep) == len(lines):
+        print("scheduler: no cron entry found")
+        return False
+    while keep and not keep[-1].strip():  # tidy the blank we inserted above it
+        keep.pop()
+    n = len(lines) - len(keep)
+    if dry:
+        _say(True, f"scheduler: remove {n} cron line(s)")
+        return True
+    if keep:
+        _crontab_write(keep)
+    else:
+        subprocess.run(["crontab", "-r"], check=False)  # our lines were the only ones
+    print(f"scheduler: removed {n} cron line(s)")
+    return True
+
+
+# ---- scheduler: Task Scheduler (Windows) -----------------------------------
+
+def _task_exists():
+    p = subprocess.run(["schtasks", "/Query", "/TN", TOOL_NAME],
+                       capture_output=True, text=True)
+    return p.returncode == 0
+
+
+def install_task(dry):
+    if _task_exists():
+        print("scheduler: scheduled task already present")
+        return False
+    if dry:
+        _say(True, f"scheduler: create scheduled task {TOOL_NAME} (every 2 minutes)")
+        return True
+    subprocess.run(["schtasks", "/Create", "/TN", TOOL_NAME, "/SC", "MINUTE",
+                    "/MO", "2", "/F", "/TR", hook_command()], check=True)
+    print(f"scheduler: scheduled task {TOOL_NAME} created (every 2 minutes)")
+    return True
+
+
+def uninstall_task(dry):
+    if not _task_exists():
+        print("scheduler: no scheduled task found")
+        return False
+    if dry:
+        _say(True, f"scheduler: delete scheduled task {TOOL_NAME}")
+        return True
+    subprocess.run(["schtasks", "/Delete", "/TN", TOOL_NAME, "/F"], check=True)
+    print(f"scheduler: scheduled task {TOOL_NAME} deleted")
+    return True
+
+
+# ---- Claude Code hooks -----------------------------------------------------
+
+def _hook_obj(event):
+    h = {"type": "command", "command": hook_command(), "timeout": 120, "async": True}
+    if event == "SessionStart":
+        h["statusMessage"] = "Syncing Codex/Claude sessions"
+    return h
+
+
+def _load_settings():
+    try:
+        with open(CLAUDE_SETTINGS, encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"{CLAUDE_SETTINGS} is not valid JSON ({e}) — refusing to edit it")
+
+
+def _save_settings(cfg):
+    if os.path.exists(CLAUDE_SETTINGS):
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(CLAUDE_SETTINGS, f"{CLAUDE_SETTINGS}.bak-{stamp}")
+    os.makedirs(os.path.dirname(CLAUDE_SETTINGS), exist_ok=True)
+    tmp = CLAUDE_SETTINGS + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, CLAUDE_SETTINGS)
+
+
+def install_hooks(dry):
+    cfg = _load_settings()
+    hooks = cfg.setdefault("hooks", {})
+    added = []
+    for event in HOOK_EVENTS:
+        groups = hooks.setdefault(event, [])
+        if any(is_ours(h.get("command")) for g in groups for h in g.get("hooks", [])):
+            continue
+        group = next((g for g in groups if g.get("matcher", "") == ""), None)
+        if group is None:
+            group = {"matcher": "", "hooks": []}
+            groups.append(group)
+        group.setdefault("hooks", []).append(_hook_obj(event))
+        added.append(event)
+    if not added:
+        print("hooks: already present in " + CLAUDE_SETTINGS)
+        return False
+    if dry:
+        _say(True, f"hooks: add {' + '.join(added)} to {CLAUDE_SETTINGS}")
+        return True
+    _save_settings(cfg)
+    print(f"hooks: added {' + '.join(added)} to {CLAUDE_SETTINGS}")
+    return True
+
+
+def uninstall_hooks(dry):
+    cfg = _load_settings()
+    hooks = cfg.get("hooks") or {}
+    removed = []
+    for event in list(hooks):
+        groups = hooks.get(event) or []
+        kept_groups = []
+        touched = False
+        for g in groups:
+            hs = g.get("hooks", [])
+            keep = [h for h in hs if not is_ours(h.get("command"))]
+            if len(keep) != len(hs):
+                touched = True
+                removed.append(event)
+                if not keep:
+                    continue  # drop a group we emptied; leave others alone
+                g = dict(g, hooks=keep)
+            kept_groups.append(g)
+        if kept_groups:
+            hooks[event] = kept_groups
+        elif touched:
+            hooks.pop(event)
+    if not removed:
+        print("hooks: none found in " + CLAUDE_SETTINGS)
+        return False
+    if not hooks:
+        cfg.pop("hooks", None)
+    if dry:
+        _say(True, f"hooks: remove {' + '.join(removed)} from {CLAUDE_SETTINGS}")
+        return True
+    _save_settings(cfg)
+    print(f"hooks: removed {' + '.join(removed)} from {CLAUDE_SETTINGS}")
+    return True
+
+
+# ---- drivers ---------------------------------------------------------------
+
+def do_install(args):
+    dry = args.dry_run
+    print(f"{TOOL_NAME}: installing {script_path()}\n")
+    if not dry:
+        os.makedirs(STATE_DIR, exist_ok=True)
+    changed = False
+    if not args.no_cron:
+        changed |= install_cron(dry)
+    if not args.no_hooks:
+        changed |= install_hooks(dry)
+    print(f"\nstate: {STATE_DIR}")
+    if dry:
+        print("\n(dry run — nothing was written)")
+    elif changed:
+        print("\nDone. The first sync runs on the next scheduler tick; run it now with:\n"
+              f"    {shlex.quote(sys.executable)} {shlex.quote(script_path())} --dry-run -v")
+        print("Claude Code loads hooks at startup — open /hooks or start a new session.")
+    else:
+        print("\nNothing to do — already installed.")
+    return 0
+
+
+def do_uninstall(args):
+    dry = args.dry_run
+    print(f"{TOOL_NAME}: uninstalling\n")
+    if not args.no_cron:
+        uninstall_cron(dry)
+    if not args.no_hooks:
+        uninstall_hooks(dry)
+    if args.purge:
+        for path in (STATE_DIR, LOG_FILE):
+            if not os.path.exists(path):
+                continue
+            _say(dry, f"purge: remove {path}")
+            if not dry:
+                shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) \
+                    else os.remove(path)
+    else:
+        print(f"\nstate kept at {STATE_DIR} (re-run with --purge to delete)")
+    print("\nSynced sessions were left in place — this only removes the automation.")
+    if dry:
+        print("(dry run — nothing was written)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     global VERBOSE
@@ -590,8 +883,27 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--quiet", action="store_true", help="no summary line (for cron)")
+
+    setup = ap.add_argument_group("setup")
+    mode = setup.add_mutually_exclusive_group()
+    mode.add_argument("--install", action="store_true",
+                      help="add the scheduler entry and Claude Code hooks if absent")
+    mode.add_argument("--uninstall", action="store_true",
+                      help="remove them if present (synced sessions are kept)")
+    setup.add_argument("--no-cron", action="store_true", help="skip the scheduler entry")
+    setup.add_argument("--no-hooks", action="store_true", help="skip the Claude Code hooks")
+    setup.add_argument("--purge", action="store_true",
+                       help="with --uninstall: also delete the state dir and log")
     args = ap.parse_args()
     VERBOSE = args.verbose
+
+    if args.install:
+        return do_install(args)
+    if args.uninstall:
+        return do_uninstall(args)
+    if args.purge or args.no_cron or args.no_hooks:
+        ap.error("--purge/--no-cron/--no-hooks only apply to --install or --uninstall")
+
     args.since_epoch = datetime.now(timezone.utc).timestamp() - args.days * 86400
 
     os.makedirs(STATE_DIR, exist_ok=True)

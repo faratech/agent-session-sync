@@ -38,13 +38,39 @@ An idle run costs about 100 ms — it stats source files and skips anything unch
 
 ## Run it automatically
 
-**cron** (every 2 minutes):
+```sh
+./agent-session-sync.py --install --dry-run   # show exactly what would change
+./agent-session-sync.py --install
+```
+
+That adds two things, each only if it isn't already there:
+
+- a **scheduler entry** every 2 minutes — cron on POSIX, Task Scheduler on Windows
+- **Claude Code hooks** (`SessionStart` + `Stop`, async) so the mirrors refresh the moment you start a session or finish a turn
+
+Claude Code reads hooks at startup, so open `/hooks` once or start a new session to pick them up. Cron covers the gap either way.
+
+To remove them again:
+
+```sh
+./agent-session-sync.py --uninstall           # scheduler + hooks
+./agent-session-sync.py --uninstall --purge   # ...and the state dir + log
+```
+
+Both are **idempotent and surgical**. They only touch crontab lines and hook objects whose command names this tool, so running `--install` twice is a no-op, an entry you wrote by hand is recognised rather than duplicated, and your other cron jobs and hooks are left byte-for-byte alone. `settings.json` is backed up before it's rewritten, and if it isn't valid JSON the installer refuses to touch it. `--uninstall` never deletes synced sessions — it only removes the automation.
+
+Use `--no-cron` or `--no-hooks` to install just one half.
+
+If you'd rather wire it up yourself, the equivalents are:
 
 ```
 */2 * * * * /usr/bin/python3 /path/to/agent-session-sync.py --quiet >> /var/log/agent-session-sync.log 2>&1
 ```
 
-**Claude Code hooks** — refresh the mirrors the moment a session starts or a turn ends. In `~/.claude/settings.json`:
+```powershell
+schtasks /create /tn agent-session-sync /sc minute /mo 2 ^
+  /tr "pythonw C:\path\to\agent-session-sync.py --quiet"
+```
 
 ```json
 {
@@ -62,13 +88,6 @@ An idle run costs about 100 ms — it stats source files and skips anything unch
     }]}]
   }
 }
-```
-
-**Windows Task Scheduler**:
-
-```powershell
-schtasks /create /tn agent-session-sync /sc minute /mo 2 /ru SYSTEM ^
-  /tr "pythonw C:\path\to\agent-session-sync.py --quiet"
 ```
 
 ## How the translation works
