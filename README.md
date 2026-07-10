@@ -70,6 +70,8 @@ Use `--no-cron` or `--no-hooks` to do just one half. `--memories` is symmetric: 
 
 Pulls the latest scripts straight from this repo and re-runs the installer, which is idempotent — so it adds only what's missing and leaves the rest alone. `memory-sync.py` comes along if it's already installed next to the script; pass `--memories` to fetch it for the first time.
 
+The ref is resolved to a commit before anything is fetched. `raw.githubusercontent.com` serves branch URLs with `cache-control: max-age=300`, which no header or query string defeats, so fetching `main` directly can hand back a five-minute-old file — and then cheerfully report *already up to date*. Commit-pinned raw URLs are immutable, so `--update` asks the API where `main` points and fetches that. A 40-character `--ref` is used as-is; if the API can't be reached it falls back to the branch and tells you.
+
 Nothing is written until **every** file has been downloaded and vetted: it must carry a shebang, identify itself in its docstring, end with its entry point, and compile. That last pair matters more than it looks — the first few KB of either script is valid Python on its own, so a truncated download would install cleanly and then silently do nothing on every cron tick. The old copy is kept as `.bak`, and the replacement is atomic, so a cron tick landing mid-update runs one version or the other, never a half-written file.
 
 If the script lives in a git checkout, `git pull` is the better move and `--update` will say so.
