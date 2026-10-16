@@ -18,8 +18,9 @@ agent-session-sync --install
 ```
 
 The installer needs only Python 3.8+. It installs a managed copy under
-`~/.local/share/agent-session-sync` (`%LOCALAPPDATA%` on Windows) with launchers in
-`~/.local/bin`, pinned to one commit (`--ref TAG|BRANCH|SHA`, default `main`).
+`~/.local/share/agent-session-sync` with launchers in `~/.local/bin` (on Windows,
+`%LOCALAPPDATA%\agent-session-sync` with `.cmd` launchers in its `bin`), pinned to
+one commit (`--ref TAG|BRANCH|SHA`, default `main`).
 When agent-session-sync is already a uv or pipx tool, it upgrades that tool instead.
 Alternatively `uv tool install .` or `pipx install .` from a checkout, or run the
 checkout directly: `python3 agent-session-sync.py doctor`. Keep the package
@@ -137,8 +138,12 @@ supported, with a guarded copy fallback on other filesystems.
 Tool arguments and results stay structured in the archive. Targets receive
 historical text blocks, avoiding mismatched tool-call protocols. Large tool
 blocks and oversized turns can be shortened in context. Attachments remain
-references; binary assets are not copied. Hidden reasoning and injected
-workspace instructions are excluded. No model-generated summary is required.
+references; binary assets are not copied. Hidden reasoning, injected workspace
+instructions, and harness-generated turns (task notifications, goal
+continuations, tool-task output) are excluded. Prompts typed while an agent is
+working and slash-command arguments such as `/goal <objective>` are kept, and
+Claude conversations are followed across `/compact` boundaries and parallel tool
+calls. No model-generated summary is required.
 
 Bounded context prioritizes the latest user request and assistant conclusion over
 older tool output. The complete handoff note is kept in the manifest and survives
@@ -152,14 +157,17 @@ snapshots: a changed source revision can create another imported session.
 Earlier snapshots aren't automatically deleted.
 
 Writes are atomic and deterministic, and sync runs share a lock. Continued or
-unfamiliar destinations are never overwritten. Malformed transcripts are
-reported; only an unfinished final JSONL record is deferred. Dry runs create no
-state, locks, archives, or hooks.
+unfamiliar destinations are never overwritten. An unfinished final JSONL record
+is deferred. A record torn by an interleaved writer, or cut short by a crash
+before the writer continued, is dropped and reported as a session issue; other
+malformed transcripts are refused. Dry runs create no state, locks, archives, or
+hooks.
 
-Antigravity's full transcript is preferred over its compact transcript. Older
-conversations with an unknown workspace are skipped during automatic sync.
-Hooks capture associations for new sessions. Use `workspace_map` or an explicit
-`--project` handoff for older ones.
+Antigravity's full transcript is preferred over its compact transcript. Its
+workspace comes from `history.jsonl`, `cache/conversation_metadata.json`, and
+`cache/last_conversations.json`, and hooks capture associations for new sessions.
+Conversations still without a workspace are skipped during automatic sync; use
+`workspace_map` or an explicit `--project` handoff for them.
 
 ## Configuration and additional harnesses
 
@@ -274,8 +282,10 @@ python3 tests/smoke_harnesses.py -v       # optional installed CLIs; offline moc
 
 Fixtures contain invented conversations shaped after documented formats and local
 record-shape inspection. Tests cover all 20 directed handoffs, parsing,
-continuations, ownership, discovery caching, dry runs, and hook protocols.
-CI is configured for Linux, macOS, and Windows. Harness formats can change; detected
+continuations, ownership, discovery caching, dry runs, hook protocols, the
+installer's in-place updates, and a regression test for every fixed issue
+(`tests/test_issue_regressions.py`). CI runs on Linux, macOS, and Windows with
+Python 3.8 and 3.13. Harness formats can change; detected
 versions aren't a claim of verified compatibility with every release.
 See [format references](docs/adapters.md#format-references).
 
