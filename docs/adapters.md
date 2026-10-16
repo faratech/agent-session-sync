@@ -81,7 +81,32 @@ to stderr and keep stdout available for the CLI's JSON and hook protocols.
 
 Fixtures are invented; no user transcripts are committed. Codex/Claude retain
 the v1 utility's supported event families, adding strict JSONL parsing and Claude
-parent-chain selection.
+parent-chain selection. Record shapes handled beyond those families, each with a
+regression test in `tests/test_issue_regressions.py`:
+
+- Codex: prompts from `event_msg` `user_message` or `item_completed` `UserMessage`
+  items; empty rollouts are not sessions yet.
+- Claude Code: `compact_boundary` records are crossed through `logicalParentUuid`,
+  or the last conversation record before the boundary, and bridged
+  `isCompactSummary` records are dropped; parallel tool calls and results and
+  `/goal` side branches hang off the active chain; mid-turn prompts are
+  `queued_command` attachments (`origin.kind == "human"`, or `Goal set:`
+  auto-continuations); `<command-args>` of slash commands, including
+  `system`/`local_command` records, are user text; `origin.kind ==
+  "task-notification"` turns are skipped; `custom-title`, then `ai-title`, names
+  the session.
+- Muse: an accepted intent links to its run by `intent_id`; `[Pasted Content N
+  chars]` display text is replaced by the run's started prompt; `goal_run_binding`
+  continuations and nudges are harness turns, and the `goal_control` objective is
+  the user's `/goal`; tool-task `output` events are not assistant replies.
+- Antigravity: workspaces come from `history.jsonl`,
+  `cache/conversation_metadata.json`, and `cache/last_conversations.json`.
+- All JSONL: a record torn by an interleaved writer, or cut short by a crash
+  before the writer continued (including NUL padding), is dropped with a session
+  issue; lone UTF-16 surrogates are replaced with U+FFFD.
+
+Changing what a built-in parser produces requires bumping `PARSER_VERSION` in
+`agent_session_sync/adapters.py`, so cached parses are refreshed.
 
 - [Muse journal and export](https://dev.meta.ai/docs/cookbook/audit-agent-sessions): schema 1, committed messages/tools, and transaction frames observed locally.
 - [Muse settings hooks](https://meta-models.github.io/muse-code-sdk/next/guides/extend/hooks/): matcher groups and `hookSpecificOutput.additionalContext`.

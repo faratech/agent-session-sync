@@ -2,6 +2,18 @@
 
 > Historical version 1 reference. Installation and update commands below describe
 > the former single-file release. Use the [current README](../README.md) for v2.
+>
+> **Moving a v1 install to v2:** v1's `--update` cannot install v2 (it refuses the
+> v2 launcher, which needs its package). Run the installer once instead; it
+> re-points the existing v1 cron entries and hooks at v2 and keeps their state:
+>
+> ```sh
+> curl -fsSL https://raw.githubusercontent.com/faratech/agent-session-sync/main/install.py | python3 - --dry-run
+> curl -fsSL https://raw.githubusercontent.com/faratech/agent-session-sync/main/install.py | python3 -
+> ```
+>
+> The last v1 release is commit `f8bdb59`; the v1 commands below fetch that
+> commit, because `main` now holds v2.
 
 Bidirectional conversation sync between [OpenAI Codex CLI](https://github.com/openai/codex) and [Claude Code](https://claude.com/claude-code).
 
@@ -24,6 +36,7 @@ Requires Python 3.8+ and nothing else. Standard library only — no packages, an
 ```sh
 git clone https://github.com/faratech/agent-session-sync
 cd agent-session-sync
+git checkout f8bdb59                       # the last v1 release; main holds v2
 ./agent-session-sync.py --dry-run -v      # preview, writes nothing
 ./agent-session-sync.py                   # sync both directions, last 30 days
 ```
@@ -33,7 +46,7 @@ No `git`? Grab the two files with the Python you already have:
 ```sh
 python3 - <<'PY'
 import os, urllib.request
-base = "https://raw.githubusercontent.com/faratech/agent-session-sync/main/"
+base = "https://raw.githubusercontent.com/faratech/agent-session-sync/f8bdb599f6f023ea5b2e9dd3d22dcb058d5c3313/"
 for f in ("agent-session-sync.py", "memory-sync.py"):
     urllib.request.urlretrieve(base + f, f)
     os.chmod(f, 0o755)
@@ -78,10 +91,12 @@ Use `--no-cron` or `--no-hooks` to do just one half. `--memories` is symmetric: 
 ## Updating
 
 ```sh
-./agent-session-sync.py --update --dry-run   # show what would change
-./agent-session-sync.py --update             # fetch from GitHub, then --install
-./agent-session-sync.py --update --ref v1.2  # a branch, tag or commit
+./agent-session-sync.py --update --ref f8bdb599f6f023ea5b2e9dd3d22dcb058d5c3313 --dry-run   # show what would change
+./agent-session-sync.py --update --ref f8bdb599f6f023ea5b2e9dd3d22dcb058d5c3313             # fetch from GitHub, then --install
 ```
+
+Without `--ref`, v1 fetches `main`, which now holds v2; its vetting refuses the v2
+launcher and nothing is changed. Use the installer above to move to v2.
 
 Pulls the latest scripts straight from this repo and re-runs the installer, which is idempotent — so it adds only what's missing and leaves the rest alone. `memory-sync.py` comes along if it's already installed next to the script; pass `--memories` to fetch it for the first time.
 
@@ -94,12 +109,12 @@ If the script lives in a git checkout, `git pull` is the better move and `--upda
 A copy installed before `--update` existed can't use it to get it, and a copy too broken to run can't heal itself. Bootstrap either case once — with `curl`, or with nothing but Python:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/faratech/agent-session-sync/main/agent-session-sync.py \
+curl -fsSL https://raw.githubusercontent.com/faratech/agent-session-sync/f8bdb599f6f023ea5b2e9dd3d22dcb058d5c3313/agent-session-sync.py \
   -o /path/to/agent-session-sync.py && chmod +x /path/to/agent-session-sync.py
 ```
 
 ```sh
-python3 -c 'import os,urllib.request as u; p="/path/to/agent-session-sync.py"; u.urlretrieve("https://raw.githubusercontent.com/faratech/agent-session-sync/main/agent-session-sync.py", p); os.chmod(p, 0o755)'
+python3 -c 'import os,urllib.request as u; p="/path/to/agent-session-sync.py"; u.urlretrieve("https://raw.githubusercontent.com/faratech/agent-session-sync/f8bdb599f6f023ea5b2e9dd3d22dcb058d5c3313/agent-session-sync.py", p); os.chmod(p, 0o755)'
 ```
 
 Bootstrapping from `main` can be served up to five minutes stale (see above). If you're chasing a commit you just pushed, put its SHA in the URL instead of `main` — those are immutable.
