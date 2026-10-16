@@ -1,226 +1,261 @@
 # agent-session-sync
 
-Bidirectional conversation sync between [OpenAI Codex CLI](https://github.com/openai/codex) and [Claude Code](https://claude.com/claude-code).
+Automatic conversation handoffs across **Codex CLI, Claude Code, Meta Muse Code,
+Google Antigravity CLI (`agy`), and GitHub Copilot CLI**.
 
-Start a conversation in one, resume it in the other. One Python file, standard library only. An opt-in companion, [`memory-sync.py`](#memory-sync-opt-in-companion), does the same for each agent's long-term memory.
+Start work in one tool and continue in another without explaining the whole task
+again. Detects installed harnesses on Linux, macOS, and Windows, caches their
+locations and versions, and keeps portable conversation archives. Python 3.8+;
+no third-party dependencies in the core.
 
-```
-~/.codex/sessions/2026/07/09/rollout-*.jsonl   <->   ~/.claude/projects/<munged-cwd>/<uuid>.jsonl
-```
-
-Both CLIs keep their history as JSONL transcripts, and both can resume a session from disk. They just can't read each other's format. This script translates between them, in place, on a timer — so `codex resume` lists your Claude conversations and `claude --resume` lists your Codex ones, natively, with no plugin or wrapper.
-
-## Why
-
-You hit a usage limit in one tool. Or you want a second model's read on a thread you've been pulling on for an hour. Or you just prefer one TUI for some kinds of work. Today that means re-explaining an hour of context by hand. This removes that step.
-
-## Install
-
-Requires Python 3.8+ and nothing else. Standard library only — no packages, and no `git`, `curl`, `requests` or `httpx`, including for `--update`, which speaks HTTPS through `urllib`.
+## Install and enable automatic handoffs
 
 ```sh
 git clone https://github.com/faratech/agent-session-sync
 cd agent-session-sync
-./agent-session-sync.py --dry-run -v      # preview, writes nothing
-./agent-session-sync.py                   # sync both directions, last 30 days
+uv tool install .                    # alternatively: pipx install .
+agent-session-sync doctor
+agent-session-sync --install --dry-run
+agent-session-sync --install
 ```
 
-No `git`? Grab the two files with the Python you already have:
+The checkout also runs directly: `python3 agent-session-sync.py doctor`.
+Keep the package directory beside the script; downloading only the script is no
+longer sufficient.
+
+Installation adds a two-minute scheduler (cron on Linux/macOS, Task Scheduler on
+Windows) and hooks for detected Claude, Muse, Antigravity, and Copilot
+installations. Start a new harness session to load its hooks. Codex history is
+picked up by the scheduler and by the other harnesses' hooks.
+
+No per-switch handoff command is required:
+
+| Harness | Incoming conversations |
+|---|---|
+| Codex CLI | Imported native session in `codex resume` |
+| Claude Code | Imported native session in `claude --resume` |
+| Meta Muse Code (`muse`) | Latest foreign conversation for the project injected by a new-session hook |
+| Antigravity (`agy`) | Latest foreign conversation for the workspace injected by a new-session hook |
+| GitHub Copilot CLI (`copilot`) | Latest foreign conversation for the project injected by a new-session hook |
+
+Context hooks leave explicit resumes and existing conversations alone. They
+don't call a model or change permissions. Selection stays within the same
+workspace; a newer conversation in the target harness takes precedence over an
+older foreign one. You can also open a harness with the latest foreign context:
 
 ```sh
-python3 - <<'PY'
-import os, urllib.request
-base = "https://raw.githubusercontent.com/faratech/agent-session-sync/main/"
-for f in ("agent-session-sync.py", "memory-sync.py"):
-    urllib.request.urlretrieve(base + f, f)
-    os.chmod(f, 0o755)
-PY
+agent-session-sync open muse --project .
+agent-session-sync open agy --project . --dry-run
 ```
 
-An idle run costs about 100 ms — it stats source files and skips anything unchanged — so it's cheap to run on a short timer.
+## Discovery and caching
 
-```
---to-claude       only sync codex -> claude
---to-codex        only sync claude -> codex
---days N          only sources modified in the last N days (default 30)
---session <id>    force one source by id, ignoring age and state
---dry-run -v      show what would happen
---quiet           no summary line (for cron)
-```
+`doctor` reports executable paths, versions, data roots, and transfer modes.
+Discovery searches `PATH`, common user installations, npm/pnpm and Cargo
+locations, Homebrew, and Windows npm, Scoop, WinGet, and App Paths. Windows
+`.exe`, `.cmd`, and `.bat` launchers are recognized.
 
-## Run it automatically
+The private `discovery.json` cache lives in the state directory. Version probes
+are reused for 24 hours. Executable, `PATH`/`PATHEXT`, and profile changes
+invalidate it. Missing and newly installed binaries are checked every run.
+Dry runs don't run version probes or write the cache.
 
 ```sh
-./agent-session-sync.py --install --dry-run   # show exactly what would change
-./agent-session-sync.py --install
+agent-session-sync doctor --refresh
+agent-session-sync doctor --json
 ```
 
-That adds two things, each only if it isn't already there:
+| Harness | Default data root | Override |
+|---|---|---|
+| Codex | `~/.codex` | `CODEX_HOME` |
+| Claude | `~/.claude` | `CLAUDE_CONFIG_DIR` |
+| Muse | `$XDG_DATA_HOME/muse`, otherwise `~/.local/share/muse` | `MUSE_HOME` |
+| Antigravity | `~/.gemini/antigravity-cli` | `AGY_HOME` |
+| Copilot | `~/.copilot` | `COPILOT_HOME` |
 
-- a **scheduler entry** every 2 minutes — cron on POSIX, Task Scheduler on Windows
-- **Claude Code hooks** (`SessionStart` + `Stop`, async) so the mirrors refresh the moment you start a session or finish a turn
+Installation captures data-root configuration for scheduler and hook processes,
+whose environments can differ from your terminal. Reinstall automation after
+changing that captured configuration.
 
-Claude Code reads hooks at startup, so open `/hooks` once or start a new session to pick them up. Cron covers the gap either way.
-
-To remove them again:
+## Inspect, export, or choose a conversation
 
 ```sh
-./agent-session-sync.py --uninstall             # scheduler + hooks
-./agent-session-sync.py --uninstall --memories  # ...and the memory companion, if installed
-./agent-session-sync.py --uninstall --purge     # ...and the state dir + logs
+agent-session-sync                      # sync detected harnesses once
+agent-session-sync --dry-run -v          # preview without persistent writes
+agent-session-sync list --project .
+agent-session-sync list --harness muse --days 90
+agent-session-sync show <session-id>
+agent-session-sync handoff <session-id> --to copilot
+agent-session-sync handoff <session-id> --to claude --launch
+agent-session-sync export <session-id> --output conversation.json
+agent-session-sync export <session-id> --format markdown
+agent-session-sync import conversation.json
+agent-session-sync import trajectory.json --harness muse --project .
 ```
 
-Use `--no-cron` or `--no-hooks` to do just one half. `--memories` is symmetric: it applies to whichever of `--install` / `--uninstall` you pass, so a plain `--uninstall` leaves the memory companion running.
+Use a native ID, an unambiguous prefix, or `harness:profile:native-id`.
+Ambiguities fail before any handoff is written. `--json` produces machine-readable
+output; `--quiet` suppresses normal output. Global options work on either side
+of a command. Explicit handoffs accept `--mode auto|native|context`, `--note TEXT`,
+and `--budget BYTES` (default 32768, minimum 1024).
 
-## Updating
+Manual imports receive a stable `imported-...` profile, preserving their origin
+identity while keeping them separate from live native caches. Use the full key
+printed by `import` when the original native ID also exists. Reimporting the same
+snapshot is idempotent; the `imported-` profile prefix is reserved.
 
-```sh
-./agent-session-sync.py --update --dry-run   # show what would change
-./agent-session-sync.py --update             # fetch from GitHub, then --install
-./agent-session-sync.py --update --ref v1.2  # a branch, tag or commit
-```
+## Conversation fidelity and safety
 
-Pulls the latest scripts straight from this repo and re-runs the installer, which is idempotent — so it adds only what's missing and leaves the rest alone. `memory-sync.py` comes along if it's already installed next to the script; pass `--memories` to fetch it for the first time.
+Each handoff contains `context.md` (bounded recent context), `transcript.md`
+(complete portable conversation), `manifest.json` (provenance and fidelity
+notices), and a pinned version 1 JSON archive. Context includes the original
+request excerpt, workspace metadata, recent turns, and an optional note.
+Destinations share the archived readable transcript through hard links where
+supported, with a guarded copy fallback on other filesystems.
 
-The ref is resolved to a commit before anything is fetched. `raw.githubusercontent.com` serves branch URLs with `cache-control: max-age=300`, which no header or query string defeats, so fetching `main` directly can hand back a five-minute-old file — and then cheerfully report *already up to date*. Commit-pinned raw URLs are immutable, so `--update` asks the API where `main` points and fetches that. A 40-character `--ref` is used as-is; if the API can't be reached it falls back to the branch and tells you.
+Tool arguments and results stay structured in the archive. Targets receive
+historical text blocks, avoiding mismatched tool-call protocols. Large tool
+blocks and oversized turns can be shortened in context. Attachments remain
+references; binary assets are not copied. Hidden reasoning and injected
+workspace instructions are excluded. No model-generated summary is required.
 
-Nothing is written until **every** file has been downloaded and vetted: it must carry a shebang, identify itself in its docstring, end with its entry point, and compile. That last pair matters more than it looks — the first few KB of either script is valid Python on its own, so a truncated download would install cleanly and then silently do nothing on every cron tick. The old copy is kept as `.bak`, and the replacement is atomic, so a cron tick landing mid-update runs one version or the other, never a half-written file.
+Bounded context prioritizes the latest user request and assistant conclusion over
+older tool output. The complete handoff note is kept in the manifest and survives
+continuation recovery. Renderer identities are versioned so upgrades can create
+new artifacts while preserving older snapshots.
 
-If the script lives in a git checkout, `git pull` is the better move and `--update` will say so.
+Sources are read-only. A → B → A creates a new linked conversation; earlier
+sessions remain available. Unchanged imports aren't imported again, while
+continuations are combined with their archived parents. Native handoffs are
+snapshots: a changed source revision can create another imported session.
+Earlier snapshots aren't automatically deleted.
 
-A copy installed before `--update` existed can't use it to get it, and a copy too broken to run can't heal itself. Bootstrap either case once — with `curl`, or with nothing but Python:
+Writes are atomic and deterministic, and sync runs share a lock. Continued or
+unfamiliar destinations are never overwritten. Malformed transcripts are
+reported; only an unfinished final JSONL record is deferred. Dry runs create no
+state, locks, archives, or hooks.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/faratech/agent-session-sync/main/agent-session-sync.py \
-  -o /path/to/agent-session-sync.py && chmod +x /path/to/agent-session-sync.py
-```
+Antigravity's full transcript is preferred over its compact transcript. Older
+conversations with an unknown workspace are skipped during automatic sync.
+Hooks capture associations for new sessions. Use `workspace_map` or an explicit
+`--project` handoff for older ones.
 
-```sh
-python3 -c 'import os,urllib.request as u; p="/path/to/agent-session-sync.py"; u.urlretrieve("https://raw.githubusercontent.com/faratech/agent-session-sync/main/agent-session-sync.py", p); os.chmod(p, 0o755)'
-```
+## Configuration and additional harnesses
 
-Bootstrapping from `main` can be served up to five minutes stale (see above). If you're chasing a commit you just pushed, put its SHA in the URL instead of `main` — those are immutable.
+Configuration defaults to `$XDG_CONFIG_HOME/agent-session-sync/config.json`
+(normally `~/.config/...`), or `%LOCALAPPDATA%\agent-session-sync\config.json` on
+Windows. Override with `--config PATH` or `AGENT_SESSION_SYNC_CONFIG`.
 
-Both are **idempotent and surgical**. Entries are matched on the *script filename* in the command (and, for crontab comments, on the tool name) — never on a bare substring, since this repo's own directory is called `agent-session-sync` and every path to `memory-sync.py` therefore contains it. So `--install` twice is a no-op, an entry you wrote by hand is recognised rather than duplicated, uninstalling one script never disturbs the other, and your unrelated cron jobs and hooks are left byte-for-byte alone.
-
-`settings.json` is backed up before it's rewritten, and if it isn't valid JSON the installer refuses to touch it. `--uninstall` never deletes synced sessions or memory files — it only removes the automation.
-
-If you'd rather wire it up yourself, the equivalents are:
-
-```
-*/2 * * * * /usr/bin/python3 /path/to/agent-session-sync.py --quiet >> /var/log/agent-session-sync.log 2>&1
-```
-
-```powershell
-schtasks /create /tn agent-session-sync /sc minute /mo 2 ^
-  /tr "pythonw C:\path\to\agent-session-sync.py --quiet"
-```
+Relative data roots, settings paths, and explicit executable paths are resolved
+from the configuration file's directory. A missing explicitly selected file is
+an error. UTF-8 input files may include a BOM; protocol and JSON output use UTF-8
+independently of the terminal's locale.
+Local `file:` workspace URIs are decoded before launching or writing native
+sessions. Windows network URIs retain their UNC host; nonlocal file URIs on
+Linux and macOS are reported rather than treated as local directories.
 
 ```json
 {
-  "hooks": {
-    "SessionStart": [{ "matcher": "", "hooks": [{
-      "type": "command",
-      "command": "/usr/bin/python3 /path/to/agent-session-sync.py --quiet",
-      "timeout": 120, "async": true,
-      "statusMessage": "Syncing Codex/Claude sessions"
-    }]}],
-    "Stop": [{ "matcher": "", "hooks": [{
-      "type": "command",
-      "command": "/usr/bin/python3 /path/to/agent-session-sync.py --quiet",
-      "timeout": 120, "async": true
-    }]}]
-  }
+  "harnesses": {
+    "muse": {"home": "/custom/muse", "executable": "/custom/bin/muse"},
+    "agy": {"workspace_map": {"conversation-uuid": "/work/my-project"}}
+  },
+  "profiles": [
+    {"harness": "codex", "name": "work", "home": "/work/codex-home"}
+  ]
 }
 ```
 
-## Memory sync (opt-in companion)
+Without `routes`, sync connects detected harnesses. To restrict it:
 
-`memory-sync.py` syncs the notes each agent keeps *about you*, rather than conversations:
-
+```json
+{
+  "routes": [
+    {"from": "codex", "to": "muse", "project": "/work/my-project"},
+    {"from": "muse", "to": "codex"}
+  ]
+}
 ```
-$CODEX_HOME/memories/memory_summary.md  <->  <claude projects>/*/memory/*.md
-```
 
-It's a separate script on purpose. Session transcripts are inert until you resume one; memory files get injected into **every** future session. That's a higher-trust write, so it stays off unless you ask for it, and it runs behind its own lock and state:
+An empty route list disables automatic transfers. Explicit handoffs still work.
+`auto_handoff: false` globally or per harness disables startup context injection;
+`enabled: false` per harness excludes it from discovery.
+
+Profiles sharing a startup-hook settings file are identified by their transcript
+paths. If a harness omits that path at startup, automatic context injection is
+skipped rather than assuming the default profile. Use separate profile settings
+files or `open harness@profile` in that case.
+
+Additional CLIs can use portable files, executable adapters, or installed Python
+entry points. See [the adapter contract](docs/adapters.md) and
+[the executable example](examples/portable_adapter.py). Private formats need an
+adapter or an export; TUIs aren't scraped.
+
+## State, upgrades, and removal
+
+Override state with `AGENT_SESSION_SYNC_STATE_DIR` or `--state-dir`. Defaults:
+`/var/lib/agent-session-sync` for POSIX root; `$XDG_STATE_HOME/agent-session-sync`
+(otherwise `~/.local/state/...`) for other POSIX users;
+`%LOCALAPPDATA%\agent-session-sync` for Windows.
+
+`sessions.sqlite3` holds the index and transfer ledger. Archives and handoffs are
+ordinary local files. The v1 `state.json` is backed up as `state-v1.json.bak`
+before migration. Registered legacy files and IDs remain intact; new native
+handoffs use independent snapshots, so a live legacy continuation is never
+replaced during migration. Keep archives and the ledger together to preserve
+lineage. Project-scoped scans use workspace hints to avoid decoding unrelated
+cached histories; completed transfers repair missing generated artifacts.
 
 ```sh
-./memory-sync.py --dry-run -v                  # preview, writes nothing
-./agent-session-sync.py --install --memories   # add its cron entry + Stop hook
+uv tool upgrade agent-session-sync      # installed package
+git pull                               # checkout
+agent-session-sync --uninstall --dry-run
+agent-session-sync --uninstall
+agent-session-sync --uninstall --purge   # also remove state and archives
 ```
 
+Uninstall removes this utility's automation; native session histories remain.
+Settings are backed up before modification and unrelated entries are preserved.
+`--no-cron` and `--no-hooks` select one part. `--update` prints package-update
+instructions instead of replacing scripts.
+
+Recorded hook destinations support cleanup after disabling or removing profiles.
+Purge coordinates with running syncs and retains lock sentinels. When automation
+is intentionally retained with `--no-cron` or `--no-hooks`, its captured config is
+also retained.
+
+## Memory companion
+
+Memory sync stays separate and opt-in:
+
+```sh
+python3 memory-sync.py --dry-run -v
+memory-sync --dry-run -v                 # installed package
+agent-session-sync --install --memories
+agent-session-sync --uninstall --memories
 ```
---to-claude       only sync codex -> claude
---to-codex        only sync claude -> codex
---mode MODE       auto (default) | full | index — what to hand Codex
---project <name>  Claude project dir to receive Codex memory
-                  (default: the one matching your home dir)
---warn-bytes N    size at which auto switches to an index (default 65536)
---dry-run -v      show what would happen
---quiet           silent when idle (for cron)
+
+It owns two generated memory files and pointers, with a separate lock and registry.
+Missing outputs and pointers are repaired while unchanged bundles keep their
+mtime. Index mode reads each source once; auto mode accounts for the complete
+bundle's size. Missing source exports leave the last snapshot unchanged.
+Scheduled memory jobs capture their default-profile data roots and state path.
+Codex SQLite memories aren't read. Plain session uninstall leaves memory
+automation running. Earlier options are documented in
+the [v1 reference](docs/v1-reference.md#memory-sync-opt-in-companion).
+
+## Development
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 tests/smoke_harnesses.py -v       # optional installed CLIs; offline mocks/echo
 ```
 
-It writes exactly two files, both of which it owns and stamps with a generated-by marker:
+Fixtures contain invented conversations shaped after documented formats and local
+record-shape inspection. Tests cover all 20 directed handoffs, parsing,
+continuations, ownership, discovery caching, dry runs, and hook protocols.
+CI is configured for Linux, macOS, and Windows. Harness formats can change; detected
+versions aren't a claim of verified compatibility with every release.
+See [format references](docs/adapters.md#format-references).
 
-- `<claude projects>/<your home project>/memory/codex_memory_sync.md`
-- `$CODEX_HOME/memories/claude_code_sync.md`
-
-plus one idempotent pointer line in each side's index — Claude's `MEMORY.md` and Codex's global `AGENTS.md`. Everything else is read-only. Codex's own `MEMORY.md`, `memory_summary.md` and `raw_memories.md` are never written, and if something *without* the marker is sitting at an owned path, it is reported and left alone rather than overwritten.
-
-Two things to know before you turn it on:
-
-- **Your Claude memories become Codex context.** The `AGENTS.md` pointer tells Codex to read the bundle, so anything in your Claude memory files can reach your Codex model provider. Read the bundle once before you trust it with secrets.
-- **The bundle is full text only while it fits.** Past `--warn-bytes` (64 KB), `--mode auto` writes an **index** instead: one line per memory file with its description and absolute path, for Codex to read on demand. On a real host that turned 324 files and 1.1 MB into 47 KB — 24× smaller — with nothing lost, since the paths are right there.
-
-Only `AGENTS.md` itself is injected into a session; the pointer is one line of it. The bundle costs nothing until the model acts on that line and reads the file, and Codex truncates tool output — so pointing at a megabyte doesn't blow the context window, it just wastes a turn on an arbitrary slice. Hence the index. `--mode full` forces the old behaviour and will refuse to add a pointer to an oversized bundle; an existing pointer is never revoked.
-
-Codex → Claude no-ops unless `memory_summary.md` exists. Recent Codex keeps memory in `memories_*.sqlite`, which this script does not read.
-
-## How the translation works
-
-Tool calls are the hard part: the two formats pair calls with results differently, and a resumed session with a dangling or mismatched tool call is rejected by the API. So tool activity is **flattened into readable text blocks** rather than translated structurally:
-
-| Direction | Tool activity becomes |
-|---|---|
-| Codex → Claude | `[codex_tool_call]` / `[codex_tool_result]` |
-| Claude → Codex | `[external_agent_tool_call]` / `[external_agent_tool_result]` |
-
-This is the same strategy Codex's own (since-removed) `external_migration` importer used, which is why both TUIs render imports natively and resume works without tool-pairing constraints. Each block is capped at 3000 characters.
-
-Real typed prompts stay as user messages. Injected context (AGENTS.md, environment preambles), sub-agent threads, and encrypted reasoning are skipped.
-
-## Safety properties
-
-The script is designed to be run repeatedly, unattended, against files you care about.
-
-- **Idempotent.** Target IDs are derived deterministically (uuid5 / a seeded uuid7) from the source session, so re-running never produces a second copy. A registry under the state dir records what was written.
-- **Never clobbers a continuation.** If you resume an imported session in the other tool, that mirror now diverges from what the script wrote. It detects this by hash and stops overwriting that file, permanently. Your continuation wins.
-- **No import loops.** A mirror is never re-imported back across the boundary. Both directions carry a marker and are checked against the registry.
-- **Atomic writes.** Every file is written to a tempfile and `os.replace`d into position.
-- **Single-flight.** A non-blocking lock means overlapping cron ticks are a no-op, not a race.
-
-Nothing is ever deleted, and the source transcript is only ever read.
-
-## State
-
-A registry of what was written, and the hashes it was written with. Both scripts share the directory but nothing inside it — `state.json` / `lock` for sessions, `memory-state.json` / `memory.lock` for memories — so one cannot stall or corrupt the other.
-
-| | |
-|---|---|
-| `$AGENT_SESSION_SYNC_STATE_DIR` | if set |
-| root, POSIX | `/var/lib/agent-session-sync` |
-| non-root, POSIX | `$XDG_STATE_HOME/agent-session-sync`, else `~/.local/state/...` |
-| Windows | `%LOCALAPPDATA%\agent-session-sync` |
-
-`$CODEX_HOME` and `$CLAUDE_CONFIG_DIR` are honored if set. Deleting the state dir is safe: the next run rebuilds it, and because IDs are deterministic it re-recognizes its own past output — but it will also forget which mirrors you had continued, so re-mirror on a clean state dir only if you haven't.
-
-## Caveats
-
-- **Claude resume is per-project.** A session imports into the project directory matching its original `cwd`, so `claude --resume` only lists it when run from that directory.
-- **An in-progress conversation lags** by up to your sync interval.
-- **Assistant text only.** Thinking blocks, images, and structured tool arguments beyond the text cap don't survive the round trip. You get a faithful transcript, not a byte-exact one.
-- The `version` fields stamped into generated records are cosmetic.
-
-## License
-
-MIT
+MIT licensed.

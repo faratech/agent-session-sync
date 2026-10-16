@@ -1,0 +1,5 @@
+{"schema_version":1,"sequence":0,"recorded_at":1792058520000,"payload_type":"runtime.session.metadata","payload":{"kind":"fact","record":{"workspace_root":"/workspace/sample","build":{"semver":"1.3.0"}}}}
+{"schema_version":1,"sequence":1,"recorded_at":1792058521000,"stream":{"kind":"session"},"payload":{"kind":"run","run_id":"r1","event":{"kind":"started","prompt":"Fix the login bug."}}}
+{"schema_version":1,"sequence":2,"recorded_at":1792058522000,"payload":{"kind":"event","run_id":"r1","event":{"kind":"assistant_tool_calls_committed","tool_calls":[{"name":"Read","call_id":"call-1","args":"{\"file\":\"auth.py\"}"}]}}}
+{"schema_version":1,"sequence":3,"recorded_at":1792058523000,"payload":{"kind":"event","run_id":"r1","event":{"kind":"tool_result_batch_committed","results":[{"tool_call_id":"call-1","text":"The expiry comparison is reversed."}]}}}
+{"schema_version":1,"sequence":4,"recorded_at":1792058524000,"payload":{"kind":"event","run_id":"r1","event":{"kind":"assistant_message_committed","text":"Fixed the comparison. The login tests pass."}}}

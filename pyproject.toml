@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-session-sync"
+version = "2.0.0"
+description = "Portable conversations and automatic handoffs across coding agent CLIs"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+agent-session-sync = "agent_session_sync.cli:main"
+memory-sync = "agent_session_sync.memory_sync:main"
+
+[tool.setuptools.packages.find]
+include = ["agent_session_sync*"]
