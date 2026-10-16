@@ -118,6 +118,7 @@ class IssueRegressionTests(Workspace):
         self.assertEqual(session.native_id, "sess-abc")
         self.assertEqual(session.title, "Fix the login bug.")
 
+    @unittest.skipIf(os.name == "nt", "extensionless executables are not found through PATHEXT on Windows")
     def test_configured_executable_symlink_is_kept_across_harness_updates(self):
         # Issue #40
         versions = self.base / "versions"

@@ -14,7 +14,7 @@ from agent_session_sync.adapters import Muse
 from agent_session_sync.automation import setup, edit_hooks, command_is_ours
 from agent_session_sync.cli import main
 from agent_session_sync.discovery import Installation, load_config
-from agent_session_sync.io import SyncError, json_bytes
+from agent_session_sync.io import SyncError, json_bytes, resolved_workspace
 from agent_session_sync.ownership import command_owner, cron_owner, SESSION, MEMORY
 from agent_session_sync.store import single_flight
 
@@ -41,7 +41,8 @@ class AutomationReviewTests(Workspace):
         command = next(shlex.split(c) for c in commands if command_owner(c) == MEMORY)
         self.assertEqual(command[command.index("--state-dir") + 1], str(self.state))
         self.assertEqual(command[command.index("--codex-home") + 1], str(self.adapters["codex"].home))
-        env = {key: value for key, value in os.environ.items() if key in ("PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP")}
+        # Windows keys are case-insensitive (Python 3.8 reports SYSTEMROOT); Python needs it to start.
+        env = {key: value for key, value in os.environ.items() if key.upper() in ("PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP")}
         env.update(HOME=str(self.base / "sanitized-home"), CODEX_HOME=str(self.base / "wrong-codex"),
                    CLAUDE_CONFIG_DIR=str(self.base / "wrong-claude"), AGENT_SESSION_SYNC_STATE_DIR=str(self.base / "wrong-state"))
         result = subprocess.run(command, cwd=str(self.project), env=env, capture_output=True, text=True)
@@ -131,10 +132,11 @@ class AutomationReviewTests(Workspace):
         path.write_bytes(json_bytes({"harnesses": {"muse": {"home": "data/muse", "settings": "muse.json", "executable": "bin/muse"}},
                                     "routes": [{"from": "muse", "to": "codex", "project": "project"}]}))
         loaded = load_config(path)
-        self.assertEqual(loaded["harnesses"]["muse"]["home"], str(folder / "data/muse"))
-        self.assertEqual(loaded["harnesses"]["muse"]["settings"], str(folder / "muse.json"))
-        self.assertEqual(loaded["harnesses"]["muse"]["executable"], str(folder / "bin/muse"))
-        self.assertEqual(loaded["routes"][0]["project"], str(folder / "project"))
+        # Data roots resolve (macOS /var -> /private/var, Windows short names); executables keep links (#40).
+        self.assertEqual(loaded["harnesses"]["muse"]["home"], resolved_workspace(str(folder / "data/muse")))
+        self.assertEqual(loaded["harnesses"]["muse"]["settings"], resolved_workspace(str(folder / "muse.json")))
+        self.assertEqual(loaded["harnesses"]["muse"]["executable"], os.path.join(resolved_workspace(str(folder)), "bin", "muse"))
+        self.assertEqual(loaded["routes"][0]["project"], resolved_workspace(str(folder / "project")))
 
     def test_purge_refuses_live_session_and_memory_writers(self):
         marker = self.state / "sessions.sqlite3"

@@ -15,7 +15,7 @@ from agent_session_sync.adapters import Muse, SessionRef, CommandAdapter
 from agent_session_sync.discovery import Installation, discover, load_config
 from agent_session_sync.cli import hook, legacy_arguments, parser, main
 from agent_session_sync.automation import setup
-from agent_session_sync.io import SyncError, json_bytes, read_records, digest
+from agent_session_sync.io import SyncError, json_bytes, read_records, digest, resolved_workspace
 from agent_session_sync.model import Event, Session, MARKER
 from agent_session_sync.store import Store
 from agent_session_sync.render import compact, DEFAULT_BUDGET
@@ -223,7 +223,10 @@ class SecondPassRegressions(Workspace):
     def test_relative_automation_config_is_absolute_and_works_from_another_cwd(self):
         config = self.base / "relative-config.json"
         config.write_bytes(json_bytes({"routes": [], "harnesses": {i.harness: {"home": i.home} for i in self.installations}}))
-        relative = os.path.relpath(str(config), os.getcwd())
+        try:
+            relative = os.path.relpath(str(config), os.getcwd())
+        except ValueError:
+            self.skipTest("the temporary directory and the working directory are on different drives")
         for adapter in self.adapters.values():
             adapter.options["settings"] = str(self.base / adapter.endpoint / "settings.json")
         with mock.patch("agent_session_sync.automation.edit_hooks", wraps=__import__("agent_session_sync.automation", fromlist=["edit_hooks"]).edit_hooks) as edit:
@@ -234,7 +237,7 @@ class SecondPassRegressions(Workspace):
         self.assertEqual(selected, str((self.state / "automation-config.json").absolute()))
         result = subprocess.run(command + ["doctor", "--dry-run", "--json"], cwd=str(self.project), capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["installations"][0]["home"], str(self.adapters["codex"].home))
+        self.assertEqual(json.loads(result.stdout)["installations"][0]["home"], resolved_workspace(str(self.adapters["codex"].home)))
 
     def test_exact_selection_reads_only_its_transcript(self):
         engine = self.engine()

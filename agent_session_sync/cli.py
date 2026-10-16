@@ -12,7 +12,7 @@ from . import __version__
 from .adapters import SessionRef, get_adapters
 from .automation import setup, shell_command, settings_path
 from .discovery import discover, load_config, state_dir
-from .engine import Engine, normalized_workspace
+from .engine import Engine
 from .io import SyncError, atomic_write, json_bytes, loads, write_output, digest, resolved_workspace
 from .model import Session, markdown, imported_snapshot
 from .render import DEFAULT_BUDGET
@@ -155,7 +155,8 @@ def hook(engine, args):
     sid = payload.get("session_id") or payload.get("sessionId") or payload.get("conversationId")
     if not workspace:
         return {}
-    workspace = normalized_workspace(workspace)
+    # Stored workspaces keep their spelling (launch cwd, Claude project names); only comparisons normcase.
+    workspace = resolved_workspace(workspace)
     if sid:
         engine.store.notify_workspace(endpoint, sid, workspace)
     # Startup injection must not alter an explicit resume, fork, or compaction.
@@ -243,7 +244,7 @@ def execute(args):
                     session = Session.from_dict(loads(raw))
                     source_sha = digest(raw)
                 if args.project:
-                    session.workspace = normalized_workspace(args.project)
+                    session.workspace = resolved_workspace(args.project)
                 session = imported_snapshot(session, args.file, source_sha)
                 session = engine.store.remember(session, imported=True)
                 if not args.dry_run:

@@ -13,7 +13,7 @@ from agent_session_sync.adapters import FileAdapter, CommandAdapter
 from agent_session_sync.automation import edit_hooks
 from agent_session_sync.cli import main, hook, emit
 from agent_session_sync.discovery import Installation, load_config
-from agent_session_sync.io import SyncError, json_bytes, digest
+from agent_session_sync.io import SyncError, json_bytes, digest, resolved_workspace
 from agent_session_sync.model import Event, imported_snapshot, timestamp
 from agent_session_sync.store import Store, APPLICATION_ID
 
@@ -192,7 +192,8 @@ class StateReviewTests(Workspace):
                 hook(engine, Namespace(harness="codex", event="start"))
         finally:
             stdin.close()
-        self.assertEqual(engine.store.workspace("codex", "unicode-session"), str(self.project))
+        # The stored spelling is resolved but not case-folded (Claude project names depend on it).
+        self.assertEqual(engine.store.workspace("codex", "unicode-session"), resolved_workspace(str(self.project)))
 
     def test_explicit_new_session_does_not_reinject_old_context(self):
         engine = self.engine()
