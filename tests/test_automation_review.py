@@ -83,12 +83,13 @@ class AutomationReviewTests(Workspace):
         self.assertEqual(cron_owner("@reboot python -m agent_session_sync"), SESSION)
 
     def test_legacy_entry_point_never_uses_old_network_updater(self):
-        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("network access")), \
+        # --update delegates to the supported installer (install.py), never v1's script replacement.
+        self.assertFalse(hasattr(legacy, "do_update") or hasattr(legacy, "_fetch"))
+        with mock.patch("agent_session_sync.cli.update", return_value=0) as update, \
              mock.patch("agent_session_sync.cli.load_config", return_value={}), \
-             mock.patch("sys.argv", ["legacy", "--update", "--dry-run"]), \
-             contextlib.redirect_stdout(io.StringIO()) as output:
+             mock.patch("sys.argv", ["legacy", "--update", "--dry-run"]):
             self.assertEqual(legacy.main(), 0)
-        self.assertIn("uv tool upgrade", output.getvalue())
+        self.assertTrue(update.call_args[0][0].dry_run)
 
     def test_uninstall_cleans_recorded_harnesses_even_when_current_config_disables_them(self):
         setup(self.adapters, self.state, {}, no_cron=True)

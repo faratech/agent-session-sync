@@ -1,6 +1,7 @@
 """CLI entry point. No arguments automatically sync all detected harnesses."""
 import argparse
 import json
+import re
 import signal
 import sqlite3
 import subprocess
@@ -72,7 +73,7 @@ def parser():
         command.add_argument("--no-hooks", action="store_true")
         command.add_argument("--memories", action="store_true")
         command.add_argument("--purge", action="store_true")
-    command = subs.add_parser("update", parents=[common], help="show package update instructions")
+    command = subs.add_parser("update", parents=[common], help="update this install and refresh its automation")
     command.add_argument("--ref", default="main")
     command.add_argument("--memories", action="store_true")
     command = subs.add_parser("hook", parents=[common], help="internal lifecycle handler")
@@ -195,9 +196,7 @@ def execute(args):
     config = load_config(args.config)
     directory = Path(args.state_dir).expanduser().absolute() if args.state_dir else state_dir()
     if args.command == "update":
-        emit("Update an installed package with `uv tool upgrade agent-session-sync` or `pipx upgrade agent-session-sync`.\n"
-             "For a git checkout, use `git pull`. Raw single-script self-updates are no longer used.", args)
-        return 0
+        return update(args)
     installations = discover(config, args.refresh, args.dry_run, directory)
     adapters = get_adapters(installations, config)
     if args.command in ("doctor", "discover"):
@@ -308,6 +307,34 @@ def execute(args):
         finally:
             signal.signal(signal.SIGINT, previous)
     return status
+
+
+def update(args):
+    """Run the published installer at a pinned commit; it updates code and automation in place."""
+    import tempfile
+    import urllib.request
+    repo = "faratech/agent-session-sync"
+    def fetch(url):
+        request = urllib.request.Request(url, headers={"User-Agent": "agent-session-sync-updater"})
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.read()
+    try:
+        sha = args.ref if re.fullmatch(r"[0-9a-f]{40}", args.ref) else json.loads(fetch("https://api.github.com/repos/{}/commits/{}".format(repo, args.ref)))["sha"]
+        source = fetch("https://raw.githubusercontent.com/{}/{}/install.py".format(repo, sha))
+        compile(source, "install.py", "exec")
+    except (OSError, ValueError, KeyError, SyntaxError) as exc:
+        raise SyncError("cannot fetch the installer for {}: {}".format(args.ref, exc))
+    if b'"""agent-session-sync installer' not in source:
+        raise SyncError("the fetched installer is not this project's installer")
+    with tempfile.TemporaryDirectory() as directory:
+        installer = Path(directory) / "install.py"
+        installer.write_bytes(source)
+        command = [sys.executable, str(installer), "--ref", sha]
+        if getattr(args, "state_dir", None):
+            command += ["--state-dir", str(Path(args.state_dir).expanduser().absolute())]
+        if args.dry_run:
+            command.append("--dry-run")
+        return subprocess.call(command)
 
 
 def main(argv=None):

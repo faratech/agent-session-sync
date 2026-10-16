@@ -11,17 +11,38 @@ no third-party dependencies in the core.
 ## Install and enable automatic handoffs
 
 ```sh
-git clone https://github.com/faratech/agent-session-sync
-cd agent-session-sync
-uv tool install .                    # alternatively: pipx install .
+curl -fsSL https://raw.githubusercontent.com/faratech/agent-session-sync/main/install.py | python3 -
 agent-session-sync doctor
 agent-session-sync --install --dry-run
 agent-session-sync --install
 ```
 
-The checkout also runs directly: `python3 agent-session-sync.py doctor`.
-Keep the package directory beside the script; downloading only the script is no
-longer sufficient.
+The installer needs only Python 3.8+. It installs a managed copy under
+`~/.local/share/agent-session-sync` (`%LOCALAPPDATA%` on Windows) with launchers in
+`~/.local/bin`, pinned to one commit (`--ref TAG|BRANCH|SHA`, default `main`).
+When agent-session-sync is already a uv or pipx tool, it upgrades that tool instead.
+Alternatively `uv tool install .` or `pipx install .` from a checkout, or run the
+checkout directly: `python3 agent-session-sync.py doctor`. Keep the package
+directory beside the script; downloading only the script is no longer sufficient.
+
+### Update an existing installation
+
+Run the same installer, or `agent-session-sync update`, on any machine where the
+tool is installed, including v1 single-script installs:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/faratech/agent-session-sync/main/install.py | python3 - --dry-run
+curl -fsSL https://raw.githubusercontent.com/faratech/agent-session-sync/main/install.py | python3 -
+agent-session-sync update                # v2 installs; --ref and --dry-run work too
+```
+
+The installer detects the automation already in place (v1 or v2 cron lines,
+scheduled tasks, harness hooks, the memory companion) and re-points exactly that
+automation at the new code, keeping its state directory and captured
+configuration. Machines that only use the CLI get new code and no automation.
+Automation that runs from a git checkout of this repository is left alone (update
+it with `git pull`); `--managed` moves it to the managed install. v1's own
+`--update` cannot install v2; run the installer once on those machines.
 
 Installation adds a two-minute scheduler (cron on Linux/macOS, Task Scheduler on
 Windows) and hooks for detected Claude, Muse, Antigravity, and Copilot
@@ -207,7 +228,7 @@ lineage. Project-scoped scans use workspace hints to avoid decoding unrelated
 cached histories; completed transfers repair missing generated artifacts.
 
 ```sh
-uv tool upgrade agent-session-sync      # installed package
+agent-session-sync update               # managed, uv, or pipx installs
 git pull                               # checkout
 agent-session-sync --uninstall --dry-run
 agent-session-sync --uninstall
@@ -216,8 +237,8 @@ agent-session-sync --uninstall --purge   # also remove state and archives
 
 Uninstall removes this utility's automation; native session histories remain.
 Settings are backed up before modification and unrelated entries are preserved.
-`--no-cron` and `--no-hooks` select one part. `--update` prints package-update
-instructions instead of replacing scripts.
+`--no-cron` and `--no-hooks` select one part. `update` (or `--update`) runs the
+published installer at a pinned commit; see "Update an existing installation".
 
 Recorded hook destinations support cleanup after disabling or removing profiles.
 Purge coordinates with running syncs and retains lock sentinels. When automation
