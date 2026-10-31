@@ -8,6 +8,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("installer", str(ROOT / "install.py"))
@@ -41,6 +42,59 @@ class ArchiveTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     installer.extract(self.archive(bad), directory)
             self.assertFalse((Path(directory).parent / "escape.py").exists())
+
+    def test_extract_refuses_empty_segments_and_windows_separators(self):
+        # Issues #120 and #93
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            destination = Path(directory) / "dest"
+            destination.mkdir()
+            for bad in ("repo-sha/" + "/" + str(outside / "evil.py").lstrip("/"), "repo-sha//" + str(outside / "evil.py"),
+                        "repo-sha/..\\..\\evil.txt", "repo-sha/C:\\evil.txt", "repo-sha/./a.py", "repo-sha/a//b.py"):
+                with self.subTest(name=bad):
+                    with self.assertRaises(OSError):
+                        installer.extract(self.archive(["repo-sha/ok.py", bad]), destination)
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertFalse((Path(directory) / "evil.txt").exists())
+            # Ordinary trees, with directory entries, still unpack.
+            data = io.BytesIO()
+            with tarfile.open(fileobj=data, mode="w:gz") as archive:
+                for name in ("repo-sha/", "repo-sha/agent_session_sync/"):
+                    info = tarfile.TarInfo(name)
+                    info.type = tarfile.DIRTYPE
+                    archive.addfile(info)
+                info = tarfile.TarInfo("repo-sha/agent_session_sync/cli.py")
+                info.size = 1
+                archive.addfile(info, io.BytesIO(b"x"))
+            installer.extract(data.getvalue(), destination)
+            self.assertTrue((destination / "agent_session_sync/cli.py").is_file())
+
+    def test_swap_restores_the_old_tree_when_the_new_one_cannot_move_in(self):
+        # Issue #121
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory)
+            (prefix / "current").mkdir()
+            (prefix / "current/marker").write_text("old")
+            staged = prefix / ".staging-x"
+            staged.mkdir()
+            real = os.replace
+            def locked(source, target):
+                if source == str(staged):
+                    raise PermissionError("locked")
+                return real(source, target)
+            with mock.patch.object(installer.os, "replace", locked), mock.patch.object(installer.time, "sleep"):
+                with self.assertRaises(OSError):
+                    installer.swap(staged, prefix)
+            self.assertEqual((prefix / "current/marker").read_text(), "old")
+            self.assertFalse((prefix / "previous").exists())
+            # A swapped-in tree that does not start is rolled back to the previous one.
+            installer.swap(staged, prefix)
+            self.assertTrue((prefix / "previous/marker").is_file())
+            self.assertTrue(installer.rollback(prefix))
+            self.assertEqual((prefix / "current/marker").read_text(), "old")
+            self.assertFalse((prefix / "previous").exists())
+            self.assertFalse(installer.rollback(prefix))
 
     def test_vet_refuses_incomplete_trees(self):
         with tempfile.TemporaryDirectory() as directory:

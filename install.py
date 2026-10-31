@@ -65,14 +65,19 @@ def resolve(ref):
 def extract(data, destination):
     """Unpack a GitHub tarball, refusing links and paths outside the tree."""
     destination = Path(destination)
+    inside = os.path.realpath(str(destination))
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
         members = archive.getmembers()
         if not members:
             raise OSError("empty source archive")
         root = members[0].name.split("/", 1)[0]
         for member in members:
-            parts = member.name.split("/")
-            if parts[0] != root or ".." in parts or member.name.startswith("/") or not (member.isfile() or member.isdir()):
+            parts = member.name.rstrip("/").split("/")
+            # Every component must be an ordinary name: an empty one ("root//tmp/x") would make
+            # the rest absolute, and on Windows a backslash or drive colon is a separator too.
+            unsafe = (parts[0] != root or member.name.startswith("/") or "\\" in member.name or ":" in member.name
+                      or any(part in ("", ".", "..") for part in parts[1:]))
+            if unsafe or not (member.isfile() or member.isdir()):
                 if member.issym() or member.islnk():
                     continue  # the project ships no links
                 raise OSError("unsafe path in source archive: " + member.name)
@@ -80,6 +85,8 @@ def extract(data, destination):
             if not relative:
                 continue
             target = destination / relative
+            if os.path.commonpath([inside, os.path.realpath(str(target))]) != inside:
+                raise OSError("unsafe path in source archive: " + member.name)
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
             else:
@@ -236,24 +243,51 @@ def _checkout(path):
 
 
 def swap(staged, prefix):
-    """Replace prefix/current with staged; a concurrent run sees one tree or the other."""
+    """Replace prefix/current with staged; a concurrent run sees one tree or the other.
+
+    The replaced tree stays at prefix/previous until commit() or rollback(). If staged cannot
+    be moved into place, the replaced tree is moved back before the error is raised.
+    """
     current, previous = prefix / "current", prefix / "previous"
     if previous.exists():
         shutil.rmtree(str(previous))
+    moved = False
     for attempt in range(10):
         try:
-            if current.exists():
+            if not moved and current.exists():
                 os.replace(str(current), str(previous))
+                moved = True
             os.replace(str(staged), str(current))
             break
         except OSError:
             # Windows refuses to rename a directory while a file inside is open.
             if attempt == 9:
+                if moved and not current.exists():
+                    os.replace(str(previous), str(current))
                 raise
             time.sleep(1)
+    return current
+
+
+def commit(prefix):
+    previous = prefix / "previous"
     if previous.exists():
         shutil.rmtree(str(previous), ignore_errors=True)
-    return current
+
+
+def rollback(prefix):
+    """Put the replaced tree back. Returns False when there was none (a first install)."""
+    current, previous = prefix / "current", prefix / "previous"
+    if not previous.exists():
+        return False
+    if current.exists():
+        broken = prefix / ".broken-{}".format(os.getpid())
+        if broken.exists():
+            shutil.rmtree(str(broken), ignore_errors=True)
+        os.replace(str(current), str(broken))
+        shutil.rmtree(str(broken), ignore_errors=True)
+    os.replace(str(previous), str(current))
+    return True
 
 
 def launchers(current, directory):
@@ -361,7 +395,14 @@ def main(argv=None):
             entry = [shutil.which("agent-session-sync") or "agent-session-sync"]
         else:
             current = swap(staged, prefix)
-            subprocess.run([sys.executable, str(current / "agent-session-sync.py"), "--version"], check=True, capture_output=True)
+            try:
+                subprocess.run([sys.executable, str(current / "agent-session-sync.py"), "--version"], check=True, capture_output=True)
+            except (OSError, subprocess.CalledProcessError) as exc:
+                restored = rollback(prefix)
+                say("the new install does not start ({}); {}".format(
+                    exc, "the previous install was restored" if restored else "no previous install to restore"))
+                return 1
+            commit(prefix)
             for path in launchers(current, bin_dir(prefix)):
                 say("launcher: " + str(path))
             if str(bin_dir(prefix)) not in os.environ.get("PATH", "").split(os.pathsep):
@@ -377,7 +418,7 @@ def main(argv=None):
             say("no automation found; enable it with `agent-session-sync install`")
         say("agent-session-sync {} is installed.".format(version))
         return 0
-    except subprocess.CalledProcessError as exc:
+    except (subprocess.CalledProcessError, OSError) as exc:
         say("install step failed: {}".format(exc))
         return 1
     finally:
