@@ -65,6 +65,9 @@ POINTER = (f"At session start, also read {CODEX_OWNED} for Claude Code memory "
            f"about this host's projects and user preferences.")
 INDEX_LINE = (f"- [{CLAUDE_OWNED_NAME}]({CLAUDE_OWNED_NAME}) — Auto-synced Codex memory: "
               f"session knowledge, reusable patterns, user preferences")
+# What makes a line a pointer: a link to the file (Claude's MEMORY.md is an index of links),
+# or Codex's AGENTS.md naming the owned file's full path. A bare mention of the name is not one.
+INDEX_NEEDLE = f"]({CLAUDE_OWNED_NAME})"
 
 # never read into the Claude -> Codex bundle
 SKIP_NAMES = {CLAUDE_OWNED_NAME, "MEMORY.md"}
@@ -250,7 +253,7 @@ def codex_to_claude(state, args):
     changed = previous != body
     if changed and not write_owned(target, body, args.dry_run, state):
         return 0
-    added = append_once(os.path.join(memdir, "MEMORY.md"), CLAUDE_OWNED_NAME, INDEX_LINE, args.dry_run) if available else False
+    added = append_once(os.path.join(memdir, "MEMORY.md"), INDEX_NEEDLE, INDEX_LINE, args.dry_run) if available else False
     if not args.dry_run:
         state["codex_summary_sha"] = digest
     if not changed and not added:
@@ -283,8 +286,9 @@ def describe(text):
 def memory_groups():
     out = []
     for project, memdir in memory_dirs():
+        # Only regular files (or links to them): a directory or a dangling link named *.md is not a memory.
         files = [f for f in sorted(os.listdir(memdir))
-                 if f.endswith(".md") and f not in SKIP_NAMES]
+                 if f.endswith(".md") and f not in SKIP_NAMES and os.path.isfile(os.path.join(memdir, f))]
         if files:
             out.append((project, memdir, files))
     return out
@@ -362,7 +366,8 @@ def claude_to_codex(state, args):
 
     mode = args.mode
     if mode == "auto":
-        overhead = len(render("full", "", stamp).encode("utf-8"))
+        # Budget against the longer header, so whichever form is chosen fits.
+        overhead = max(len(render(m, "", stamp).encode("utf-8")) for m in ("full", "index"))
         mode, body_core = build_auto(groups, args.warn_bytes - overhead)
     elif mode == "index":
         body_core = build_index(groups)
@@ -376,17 +381,18 @@ def claude_to_codex(state, args):
     if not unchanged and not write_owned(CODEX_OWNED, body, args.dry_run, state):
         return 0
     size = len(body.encode("utf-8"))
-    already = "claude_code_sync" in read(CODEX_AGENTS)
+    already = CODEX_OWNED in read(CODEX_AGENTS)
     added = False
     if available:
-        if size > args.warn_bytes and not already:
+        # An index is already the smallest form, so it is pointed at even when over budget.
+        if size > args.warn_bytes and not already and mode == "full":
             if not unchanged:
                 print(f"not pointing {os.path.basename(CODEX_AGENTS)} at a {size // 1024}K bundle; "
                       "use index mode or raise --warn-bytes", file=sys.stderr)
         else:
             if size > args.warn_bytes and not unchanged:
                 print(f"warning: {CODEX_OWNED} exceeds --warn-bytes", file=sys.stderr)
-            added = append_once(CODEX_AGENTS, "claude_code_sync", POINTER, args.dry_run)
+            added = append_once(CODEX_AGENTS, CODEX_OWNED, POINTER, args.dry_run)
     if not args.dry_run:
         state["claude_memory_sha"] = digest
     if unchanged and not added:
@@ -450,16 +456,21 @@ def _main(argv=None):
 
     try:
         state = load_state()
-        n = 0
-        if not args.to_codex:
-            n += codex_to_claude(state, args)
-        if not args.to_claude:
-            n += claude_to_codex(state, args)
+        n = failed = 0
+        # The directions read and write disjoint files; one failing must not stop the other.
+        for wanted, direction in ((not args.to_codex, codex_to_claude), (not args.to_claude, claude_to_codex)):
+            if not wanted:
+                continue
+            try:
+                n += direction(state, args)
+            except (SyncError, OSError, ValueError) as exc:
+                print(f"memory-sync: {direction.__name__.replace('_to_', '->')}: {exc}", file=sys.stderr)
+                failed += 1
         if not args.dry_run:
             save_state(state)
-        if n == 0 and not args.quiet:
+        if n == 0 and not failed and not args.quiet:
             print("memory-sync: nothing to do")
-        return 0
+        return 1 if failed else 0
     finally:
         if lock is not None:
             lock.close()
