@@ -157,7 +157,8 @@ snapshots: a changed source revision can create another imported session.
 Earlier snapshots aren't automatically deleted.
 
 Writes are atomic and deterministic, and sync runs share a lock. Continued or
-unfamiliar destinations are never overwritten. An unfinished final JSONL record
+unfamiliar destinations are never overwritten, and a native history that already
+exists is never rewritten. Symlinked destinations are written through. An unfinished final JSONL record
 is deferred. A record torn by an interleaved writer, or cut short by a crash
 before the writer continued, is dropped and reported as a session issue; other
 malformed transcripts are refused. Dry runs create no state, locks, archives, or

@@ -369,17 +369,24 @@ class Engine:
                 continue
             expected = None
             target = path == item.get("target")
-            if target and previous and previous.get("state") == "complete":
-                if Path(path).exists() and digest(Path(path).read_bytes()) != previous["target_sha"]:
+            if target and Path(path).exists():
+                current = digest(Path(path).read_bytes())
+                if previous and previous.get("state") == "complete" and current != previous["target_sha"]:
                     # A resumed import must remain resumable; its continuation is ingested separately.
                     continued = True
                     continue
-                # Environment details outside the transfer id (CLI version) may change the bytes.
-                expected = previous["target_sha"]
-            elif target and previous and previous.get("target_sha"):
-                # An interrupted attempt may have written its planned target before the crash.
-                expected = previous["target_sha"]
-            elif path == manifest and Path(path).is_file():
+                if current == digest(data) or previous and current == previous.get("target_sha"):
+                    # An existing native history is never rewritten: a harness can continue it at any
+                    # moment, and no check-then-replace is atomic against that. The copy from an
+                    # earlier or interrupted attempt of this transfer is kept as it is, even when
+                    # environment details outside the transfer id (CLI version) changed the bytes.
+                    if current != item["target_sha"]:
+                        item = dict(item, target_sha=current)
+                    continue
+            if path == manifest:
+                # The manifest follows the target it describes.
+                data = json_bytes(dict(item, state="complete"))
+            if path == manifest and Path(path).is_file():
                 # The manifest records the launch command, which follows the executable's location.
                 try:
                     owned = json.loads(Path(path).read_bytes()).get("id") == item["id"]

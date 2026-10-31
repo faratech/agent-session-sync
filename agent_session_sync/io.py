@@ -144,6 +144,25 @@ def atomic_share(source, path, data):
         atomic_write(path, data)
 
 
+def exclusive_copy(path, data):
+    try:
+        descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    except FileExistsError:
+        raise SyncError("destination appeared during commit: {}".format(path))
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        # A partial copy must not be mistaken for a complete artifact.
+        try:
+            os.unlink(str(path))
+        except OSError:
+            pass
+        raise
+
+
 def read_records(path):
     """Read a consistent snapshot; only an invalid, unterminated tail is deferred."""
     path = Path(path)
@@ -223,8 +242,13 @@ def torn_suffix(line):
 
 
 def atomic_write(path, data, expected=None, replace=False):
-    """Unknown destinations are never replaced. expected is the owned baseline."""
+    """Unknown destinations are never replaced. expected is the owned baseline.
+
+    A symlinked destination is written through, so the link and its target stay in place.
+    """
     path = Path(path)
+    if path.is_symlink():
+        path = Path(os.path.realpath(str(path)))
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         old = path.read_bytes()
@@ -264,7 +288,9 @@ def atomic_write(path, data, expected=None, replace=False):
                     except FileExistsError:
                         raise SyncError("destination appeared during commit: {}".format(path))
                 else:
-                    raise SyncError("filesystem lacks atomic exclusive creation for {}: {}".format(path, exc))
+                    # No hard links here (FAT, exFAT, some FUSE and network mounts). An exclusively
+                    # created copy still never replaces a file a concurrent harness created.
+                    exclusive_copy(path, data)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)

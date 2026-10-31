@@ -387,8 +387,8 @@ open({marker!r}, "w").write(status)
         engine.sync(source="claude", destination="codex", days=None)
         self.assertFalse(engine.errors, engine.errors)
 
-    def test_crash_recovery_replaces_target_matching_planned_sha(self):
-        # Issue #55
+    def test_crash_recovery_keeps_target_matching_planned_sha(self):
+        # Issue #55; since #105 the interrupted attempt's target is kept rather than rewritten.
         self.addCleanup(setattr, legacy, "_codex_version", None)
         engine = self.engine()
         source = self.read("muse")
@@ -403,8 +403,10 @@ open({marker!r}, "w").write(status)
         self.assertNotEqual(retry_files[retry["target"]], files[item["target"]])
         result = engine.handoff(source, "codex")
         self.assertEqual(result["state"], "complete")
-        self.assertEqual(Path(result["target"]).read_bytes(), retry_files[retry["target"]])
-        self.assertEqual(engine.store.transfer(item["id"])["target_sha"], digest(retry_files[retry["target"]]))
+        self.assertEqual(Path(result["target"]).read_bytes(), files[item["target"]])
+        self.assertEqual(engine.store.transfer(item["id"])["target_sha"], digest(files[item["target"]]))
+        manifest = json.loads(Path(result["context"]).with_name("manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["target_sha"], digest(files[item["target"]]))
 
     def test_empty_windows_appdata_variables_yield_no_relative_candidates(self):
         # Issue #56
