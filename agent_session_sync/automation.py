@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -34,8 +35,16 @@ def shell_command(argv, windows=None, powershell=False):
     is_windows = os.name == "nt" if windows is None else windows
     if is_windows:
         # Every argument is quoted, including metacharacters in paths without spaces.
-        return " ".join('"' + a.replace('"', '""') + '"' for a in argv)
+        return " ".join(windows_quote(a) for a in argv)
     return " ".join(shlex.quote(a) for a in argv)
+
+
+def windows_quote(arg):
+    """Quote for CommandLineToArgvW: backslashes are literal except before a quote, so a run
+    of them before an embedded or the closing quote is doubled (D:\\ stays one argument)."""
+    arg = re.sub(r'(\\*)"', lambda m: m.group(1) * 2 + '""', arg)
+    arg = re.sub(r'(\\+)$', lambda m: m.group(1) * 2, arg)
+    return '"' + arg + '"'
 
 
 SCHTASKS_TR_LIMIT = 261
@@ -105,7 +114,10 @@ def edit_hooks(adapter, command_base, uninstall=False):
         old = hooks.get(OWNER)
         if old is not None and not isinstance(old, dict):
             raise SyncError("invalid named hook definition: " + str(path))
-        if old and not all(isinstance(h, dict) and command_is_ours(h) for e, handlers in old.items() if isinstance(handlers, list) for h in handlers):
+        # Every handler list under our name must hold only our commands; anything else
+        # (another command, or a definition we do not recognize) is not ours to replace.
+        if old and not all(isinstance(handlers, list) and all(isinstance(h, dict) and command_is_ours(h) for h in handlers)
+                           for handlers in old.values()):
             raise SyncError("hook name is already owned by another command: " + str(path))
         hooks.pop(OWNER, None)
         if not uninstall:
@@ -322,6 +334,9 @@ def _setup(adapters, directory, config, config_path=None, uninstall=False, dry_r
             for spec, command in jobs:
                 cron_lines = [line for line in cron_lines if not legacy.line_is_ours(line, spec)]
                 if not uninstall:
+                    if any("\n" in arg or "\r" in arg for arg in command + [spec["log"]]):
+                        # A crontab entry is one line; quoting cannot carry a line break.
+                        raise SyncError("cron cannot run a command whose paths contain a line break: " + repr(spec["log"]))
                     # cron turns an unescaped % into a newline.
                     entry = (shell_command(command) + " >> " + shlex.quote(spec["log"]) + " 2>&1").replace("%", "\\%")
                     cron_lines.extend(["# " + spec["name"] + " — " + spec["blurb"], spec["schedule"] + " " + entry])

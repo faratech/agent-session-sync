@@ -21,22 +21,72 @@ def _script_owner(value):
     return None
 
 
+# env options that take a separate value (GNU and BSD spellings).
+ENV_VALUE_OPTIONS = {"-u", "--unset", "-C", "--chdir", "-P", "-a", "--argv0"}
+
+
+def _strip_env(args):
+    """The command env runs, past its options and NAME=value assignments."""
+    args = args[1:]
+    while args:
+        arg = args[0]
+        if arg == "--":
+            return args[1:]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", arg):
+            args = args[1:]
+        elif arg in ("-S", "--split-string") or arg.startswith(("-S", "--split-string=")):
+            # -S splits one string into the command and its leading arguments.
+            if arg in ("-S", "--split-string"):
+                value, rest = (args[1] if len(args) > 1 else ""), args[2:]
+            else:
+                value, rest = (arg.split("=", 1)[1] if arg.startswith("--") else arg[2:]), args[1:]
+            try:
+                return shlex.split(value) + rest
+            except ValueError:
+                return []
+        elif arg in ENV_VALUE_OPTIONS:
+            args = args[2:]
+        elif arg.startswith("-") and arg != "-":
+            args = args[1:]  # -i, -0, -v, --ignore-environment, -uNAME, --unset=NAME, ...
+        else:
+            break
+    return args
+
+
+def _words(command):
+    """Candidate argument lists: POSIX words, plus Windows words when the command contains
+    backslashes, which POSIX quoting consumes (C:\\tools becomes C:tools)."""
+    candidates = []
+    try:
+        candidates.append(shlex.split(command))
+    except ValueError:
+        pass
+    if "\\" in command:
+        try:
+            words = shlex.split(command, posix=False)
+        except ValueError:
+            words = command.split()
+        candidates.append([w[1:-1] if len(w) >= 2 and w[0] == w[-1] == '"' else w for w in words])
+    return candidates
+
+
 def command_owner(command):
     if isinstance(command, str):
-        try:
-            args = shlex.split(command)
-        except ValueError:
-            return None
-    elif isinstance(command, list) and all(isinstance(arg, str) for arg in command):
-        args = list(command)
-    else:
+        for args in _words(command):
+            owner = _args_owner(args)
+            if owner:
+                return owner
         return None
+    if isinstance(command, list) and all(isinstance(arg, str) for arg in command):
+        return _args_owner(list(command))
+    return None
+
+
+def _args_owner(args):
     while args and (args[0] == "&" or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", args[0])):
         args.pop(0)
     if args and _basename(args[0]) in ("env", "env.exe"):
-        args.pop(0)
-        while args and (args[0] == "--" or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", args[0])):
-            args.pop(0)
+        args = _strip_env(args)
     if not args:
         return None
     direct = _script_owner(args[0])
