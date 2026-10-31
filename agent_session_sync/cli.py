@@ -1,6 +1,7 @@
 """CLI entry point. No arguments automatically sync all detected harnesses."""
 import argparse
 import json
+import os
 import re
 import signal
 import sqlite3
@@ -21,6 +22,16 @@ from .render import DEFAULT_BUDGET
 from .store import single_flight
 
 
+class UsageError(Exception):
+    pass
+
+
+class Parser(argparse.ArgumentParser):
+    """Raises usage errors so --json callers get them as JSON too."""
+    def error(self, message):
+        raise UsageError("{}: error: {}".format(self.prog, message), self.format_usage())
+
+
 def parser():
     common = argparse.ArgumentParser(add_help=False)
     for flag in ("--dry-run", "--json", "--quiet", "--refresh"):
@@ -28,7 +39,7 @@ def parser():
     common.add_argument("--config", default=argparse.SUPPRESS)
     common.add_argument("--state-dir", default=argparse.SUPPRESS)
     common.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
-    root = argparse.ArgumentParser(description="Automatically share conversations across detected CLI harnesses.", parents=[common])
+    root = Parser(description="Automatically share conversations across detected CLI harnesses.", parents=[common])
     root.add_argument("--version", action="version", version=__version__)
     subs = root.add_subparsers(dest="command")
     for name in ("doctor", "discover"):
@@ -79,7 +90,7 @@ def parser():
                          help="keep anything written within this many days (default: retention_days in the config, else 3)")
     command = subs.add_parser("update", parents=[common], help="update this install and refresh its automation")
     command.add_argument("--ref", default="main")
-    command.add_argument("--memories", action="store_true")
+    command.add_argument("--memories", action="store_true", help=argparse.SUPPRESS)
     command = subs.add_parser("hook", parents=[common], help="internal lifecycle handler")
     command.add_argument("--harness", required=True)
     command.add_argument("--event", choices=("start", "stop"), required=True)
@@ -342,6 +353,10 @@ def update(args):
     """Run the published installer at a pinned commit; it updates code and automation in place."""
     import tempfile
     import urllib.request
+    if args.memories:
+        # The installer refreshes the automation already in place; it never adds any.
+        raise SyncError("update keeps the automation already in place; enable the memory companion "
+                        "with `agent-session-sync install --memories`")
     repo = "faratech/agent-session-sync"
     def fetch(url):
         request = urllib.request.Request(url, headers={"User-Agent": "agent-session-sync-updater"})
@@ -363,16 +378,50 @@ def update(args):
             command += ["--state-dir", str(Path(args.state_dir).expanduser().absolute())]
         if args.dry_run:
             command.append("--dry-run")
-        return subprocess.call(command)
+        if not (args.json or args.quiet):
+            return subprocess.call(command)
+        # The installer always narrates; keep that out of machine-readable or quiet output.
+        process = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, encoding="utf-8", errors="replace")
+        if args.json:
+            emit({"ref": args.ref, "commit": sha, "dry_run": args.dry_run, "status": process.returncode,
+                  "output": process.stdout.splitlines()}, args)
+        elif process.returncode:
+            sys.stderr.write(process.stdout)
+        return process.returncode
+
+
+def broken_pipe():
+    """The reader went away. Point stdout at devnull so the exit flush adds no noise."""
+    try:
+        descriptor = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(descriptor, sys.stdout.fileno())
+        os.close(descriptor)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return 1
 
 
 def main(argv=None):
-    args = parser().parse_args(legacy_arguments(list(sys.argv[1:] if argv is None else argv)))
+    argv = legacy_arguments(list(sys.argv[1:] if argv is None else argv))
+    try:
+        args = parser().parse_args(argv)
+    except UsageError as exc:
+        message, usage = exc.args
+        # Global options work on either side of the command, so look before any "--".
+        if "--json" in (argv[:argv.index("--")] if "--" in argv else argv):
+            write_output(json.dumps({"error": message, "usage": usage.strip()}))
+        else:
+            sys.stderr.write(usage + message + "\n")
+        return 2
     for name, value in dict(dry_run=False, json=False, quiet=False, refresh=False, config=None, state_dir=None, verbose=False).items():
         if not hasattr(args, name):
             setattr(args, name, value)
     try:
         return execute(args)
+    except BrokenPipeError:
+        status = broken_pipe()
+        return 0 if args.command == "hook" else status
     except Exception as exc:
         # Hooks must never block a turn or emit malformed protocol output.
         if args.command == "hook":

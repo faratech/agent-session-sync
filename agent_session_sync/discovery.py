@@ -282,8 +282,9 @@ def discover(config=None, refresh=False, dry_run=False, directory=None):
             item.version = previous.get("version", "unknown")
         elif item.executable and not dry_run:
             try:
+                # A version banner in another encoding must not stop discovery.
                 process = subprocess.run([item.executable, "--version"], stdin=subprocess.DEVNULL,
-                                         capture_output=True, text=True, timeout=3)
+                                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3)
                 if process.returncode == 0:
                     item.version = (process.stdout or process.stderr).strip().splitlines()[0][:200]
             except (OSError, subprocess.TimeoutExpired, IndexError):

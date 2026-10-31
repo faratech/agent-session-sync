@@ -117,8 +117,10 @@ agent-session-sync import trajectory.json --harness muse --project .
 
 Use a native ID, an unambiguous prefix, or `harness:profile:native-id`.
 Ambiguities fail before any handoff is written. `--json` produces machine-readable
-output; `--quiet` suppresses normal output. Global options work on either side
-of a command. Explicit handoffs accept `--mode auto|native|context`, `--note TEXT`,
+output, errors included (`{"error": ...}`); `--quiet` suppresses normal output.
+Both apply to `update` too, which then reports the installer's output only as JSON
+or on failure. The exit status is 0 on success, 1 on an error, and 2 on a usage
+error. Global options work on either side of a command. Explicit handoffs accept `--mode auto|native|context`, `--note TEXT`,
 and `--budget BYTES` (default 32768, minimum 1024).
 
 Manual imports receive a stable `imported-...` profile, preserving their origin
