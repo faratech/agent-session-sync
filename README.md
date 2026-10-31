@@ -235,6 +235,31 @@ replaced during migration. Keep archives and the ledger together to preserve
 lineage. Project-scoped scans use workspace hints to avoid decoding unrelated
 cached histories; completed transfers repair missing generated artifacts.
 
+### Retention
+
+Each time a conversation changes, sync writes a complete new archive snapshot and
+one handoff folder per destination. Older copies are pruned automatically, at
+most once a day, after a scheduled sync. Only files nothing can use are
+removed. These are always kept:
+
+- the newest transfer of every source/destination route;
+- any transfer a conversation was continued from (its continuation is rebuilt
+  from that parent archive);
+- the transfer the current inbox pointer names;
+- the newest snapshot of every conversation.
+
+Everything else goes once it is older than `retention_days` (default 3). Set the
+key in the config file to change the window, or set it to `0` to turn
+automatic pruning off. To prune by hand:
+
+```sh
+agent-session-sync prune --dry-run          # report what would be removed
+agent-session-sync prune --keep-days 7      # remove copies older than 7 days
+```
+
+Transfer records stay in `sessions.sqlite3`. A pruned handoff is never re-rendered,
+because the next sync only checks each route's newest transfer.
+
 ```sh
 agent-session-sync update               # managed, uv, or pipx installs
 git pull                               # checkout

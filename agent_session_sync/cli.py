@@ -16,6 +16,7 @@ from .discovery import discover, load_config, state_dir
 from .engine import Engine
 from .io import SyncError, atomic_write, json_bytes, loads, write_output, digest, resolved_workspace
 from .model import Session, markdown, imported_snapshot
+from .prune import DEFAULT_RETENTION_DAYS, due as prune_due, mark_pruned, prune, retention_from
 from .render import DEFAULT_BUDGET
 from .store import single_flight
 
@@ -73,6 +74,9 @@ def parser():
         command.add_argument("--no-hooks", action="store_true")
         command.add_argument("--memories", action="store_true")
         command.add_argument("--purge", action="store_true")
+    command = subs.add_parser("prune", parents=[common], help="remove superseded archive snapshots and handoff folders")
+    command.add_argument("--keep-days", type=float, default=None,
+                         help="keep anything written within this many days (default: retention_days in the config, else 3)")
     command = subs.add_parser("update", parents=[common], help="update this install and refresh its automation")
     command.add_argument("--ref", default="main")
     command.add_argument("--memories", action="store_true")
@@ -84,8 +88,8 @@ def parser():
 
 def legacy_arguments(argv):
     aliases = {"--install": "install", "--uninstall": "uninstall", "--update": "update"}
-    commands = {"doctor", "discover", "list", "show", "export", "import", "handoff", "open", "sync", "install", "uninstall", "update", "hook"}
-    value_options = {"--config", "--state-dir", "--days", "--session", "--project", "--from", "--to", "--budget", "--ref"}
+    commands = {"doctor", "discover", "list", "show", "export", "import", "handoff", "open", "sync", "prune", "install", "uninstall", "update", "hook"}
+    value_options = {"--config", "--state-dir", "--days", "--session", "--project", "--from", "--to", "--budget", "--ref", "--keep-days"}
     index = 0
     while index < len(argv):
         token = argv[index]
@@ -192,6 +196,22 @@ def hook(engine, args):
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
 
 
+def auto_prune(engine, directory, config, args):
+    """Daily retention after a scheduled sync. A failure is reported but never fails the sync."""
+    days = retention_from(config)
+    if args.dry_run or days is None or not prune_due(engine.store):
+        return
+    try:
+        report = prune(engine.store, directory, days)
+        mark_pruned(engine.store)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        print("agent-session-sync: prune skipped: {}".format(exc), file=sys.stderr)
+        return
+    if args.verbose and not args.json:
+        print("pruned {} handoff folder(s), {} archive snapshot(s), {:.1f} MB".format(
+            report["handoffs_removed"], report["archives_removed"], report["bytes_freed"] / 1e6), file=sys.stderr)
+
+
 def execute(args):
     config = load_config(args.config)
     directory = Path(args.state_dir).expanduser().absolute() if args.state_dir else state_dir()
@@ -292,6 +312,15 @@ def execute(args):
                 if args.verbose and not args.json:
                     for item in results:
                         print("{} -> {} ({})".format(item["source_key"], item["destination"], item["mode"]), file=sys.stderr)
+                auto_prune(engine, directory, config, args)
+            elif args.command == "prune":
+                days = args.keep_days if args.keep_days is not None else (retention_from(config) or DEFAULT_RETENTION_DAYS)
+                report = prune(engine.store, directory, days, args.dry_run)
+                if not args.dry_run:
+                    mark_pruned(engine.store)
+                emit(report if args.json else "{}{} handoff folder(s) and {} archive snapshot(s), {:.1f} MB (kept {} live transfers, retention {} days)".format(
+                    "Would remove " if args.dry_run else "Removed ", report["handoffs_removed"], report["archives_removed"],
+                    report["bytes_freed"] / 1e6, report["kept_transfers"], days), args)
             if engine.errors and not args.json:
                 for error in engine.errors:
                     print("agent-session-sync: " + error, file=sys.stderr)
