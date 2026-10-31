@@ -12,7 +12,7 @@ from .model import Event, Session, MARKER, identity, timestamp
 
 WORKSPACE_UNKNOWN = "workspace unknown; supply workspace_map or capture a hook notification"
 # Bump when a built-in parser's output changes so cached parses are refreshed.
-PARSER_VERSION = 2
+PARSER_VERSION = 3
 
 
 @dataclass
@@ -49,6 +49,7 @@ def slash_command(value):
 def choose_title(prompts, fallback):
     """The first prompt that states a task; a slash command with at most one
     argument (/effort medium) names a setting, while /goal <objective> is a task."""
+    prompts = [t for t in prompts if t.strip()]
     title = next((t for t in prompts if not re.fullmatch(r"/\S+(\s+\S+)?", t.strip())), prompts[0] if prompts else fallback)
     return title[:100].replace("\n", " ")
 
@@ -72,7 +73,11 @@ class Adapter:
 
     def read(self, ref):
         records, issues, source_sha = read_records(ref.path)
-        session = self.parse(records, ref)
+        try:
+            session = self.parse(records, ref)
+        except (AttributeError, TypeError, RecursionError) as exc:
+            # A field of the wrong JSON type (a string where an object belongs) is a malformed transcript.
+            raise SyncError("malformed {} transcript {}: {}".format(self.installation.harness, ref.path, exc))
         session.source_sha = source_sha
         session.source_path = str(Path(ref.path).absolute())
         session.issues.extend(issues)
@@ -140,6 +145,11 @@ class Codex(Adapter):
         if meta is None:
             raise SyncError("Codex transcript lacks session_meta: " + ref.path)
         session = self.session(ref, meta.get("cwd", ""), branch=(meta.get("git") or {}).get("branch", ""))
+        if isinstance(meta.get("id"), str) and meta["id"].strip():
+            # The rollout names its own session; a renamed or copied file is still that session.
+            if session.title == session.native_id:
+                session.title = meta["id"]
+            session.native_id = meta["id"]
         if (meta.get("base_instructions") or {}).get("text", "").startswith("External import of Claude Code session"):
             session.provenance = {"legacy_import": True}
         if meta.get("thread_source") == "subagent" or isinstance(meta.get("source"), dict) and "subagent" in meta["source"]:
@@ -199,8 +209,10 @@ class Claude(Adapter):
         position = {id(r): i for i, r in enumerate(records)}
         leaf = next((r for r in reversed(records) if r.get("type") in ("user", "assistant")
                      and not r.get("isSidechain") and r.get("uuid")), None)
-        # A leaf with an explicit null parent is a new root (an edited first prompt).
-        if leaf and (leaf.get("parentUuid") in indexed or "parentUuid" in leaf and leaf["parentUuid"] is None):
+        # A leaf with an explicit null parent is a new root (an edited first prompt). So is a leaf
+        # without the field when the rest of the file is chained: it links to nothing earlier.
+        chained = any("parentUuid" in r for r in records)
+        if leaf and (leaf.get("parentUuid") in indexed or leaf.get("parentUuid") is None and ("parentUuid" in leaf or chained)):
             every = records
             chain, visited, bridged = [], set(), set()
             while leaf:
@@ -384,8 +396,11 @@ class Muse(Adapter):
         harness_runs = {(r.get("payload", {}).get("event") or {}).get("record", {}).get("run_id") for r in expanded
                         if (r.get("payload", {}).get("event") or {}).get("kind") == "goal_run_binding"
                         and (r["payload"]["event"].get("record") or {}).get("authority_kind") in ("continuation", "progress_nudge")} - {None}
-        displayed_runs = {r.get("payload", {}).get("run_id") for r in expanded if (r.get("payload", {}).get("event") or {}).get("kind") == "user_prompt_display"}
-        started_runs = {r.get("payload", {}).get("run_id") for r in expanded if (r.get("payload", {}).get("event") or {}).get("kind") == "started" and "prompt" in r.get("payload", {}).get("event", {})}
+        # A displayed prompt links to its run by run_id, or in current builds by intent_id.
+        # Records with neither link to nothing, so they never suppress one another.
+        displayed_runs = {r.get("payload", {}).get(field) for r in expanded if (r.get("payload", {}).get("event") or {}).get("kind") == "user_prompt_display"
+                          for field in ("run_id", "intent_id")} - {None}
+        started_runs = {r.get("payload", {}).get("run_id") for r in expanded if (r.get("payload", {}).get("event") or {}).get("kind") == "started" and "prompt" in r.get("payload", {}).get("event", {})} - {None}
         full_prompts = {r.get("payload", {}).get("run_id"): r["payload"]["event"]["prompt"] for r in expanded
                         if (r.get("payload", {}).get("event") or {}).get("kind") == "started"
                         and isinstance(r["payload"]["event"].get("prompt"), str) and r["payload"]["event"]["prompt"]}
@@ -462,10 +477,11 @@ class Antigravity(Adapter):
         mapping = {}
         try:
             # The prompt history names each conversation's workspace, including ones the caches dropped.
-            with open(str(self.home / "history.jsonl"), encoding="utf-8-sig") as stream:
+            with open(str(self.home / "history.jsonl"), "rb") as stream:
                 for line in stream:
+                    # This is only a workspace lookup: an undecodable or invalid line is skipped.
                     try:
-                        entry = json.loads(line)
+                        entry = json.loads(line.decode("utf-8").lstrip("\ufeff"))
                     except ValueError:
                         continue
                     if isinstance(entry, dict) and isinstance(entry.get("conversationId"), str) \
@@ -493,7 +509,10 @@ class Antigravity(Adapter):
         session.workspace = mapping.get(ref.native_id, "")
         for record in records:
             if ref.native_id not in explicit:
-                session.workspace = session.workspace or record.get("cwd", "") or next(iter(record.get("workspacePaths", [])), "")
+                paths = record.get("workspacePaths")
+                if paths is not None and (not isinstance(paths, list) or any(not isinstance(p, str) for p in paths)):
+                    raise SyncError("Antigravity workspacePaths must be an array of strings: " + ref.path)
+                session.workspace = session.workspace or record.get("cwd", "") or next(iter(paths or []), "")
             kind = record.get("type")
             if record.get("status") not in (None, "DONE", "ERROR", "CANCELLED"):
                 continue
@@ -507,7 +526,7 @@ class Antigravity(Adapter):
                 self.add(session, record, "assistant", value)
             elif kind in ("RUN_COMMAND", "CODE_ACTION", "TOOL_RESULT") or record.get("source") == "TOOL" or kind == "GENERIC" and record.get("source") == "MODEL":
                 self.add(session, record, "tool_result", value, name=kind)
-            for call in record.get("tool_calls", []):
+            for call in record.get("tool_calls") or []:
                 self.add(session, record, "tool_call", name=call.get("name"), call_id=call.get("id"), data={"arguments": call.get("args", {})})
         if not session.workspace:
             session.issues.append(WORKSPACE_UNKNOWN)
@@ -531,16 +550,17 @@ class Copilot(Adapter):
             kind = record.get("type")
             if kind == "session.start":
                 context = data.get("context") or {}
-                session.workspace = context.get("cwd") or data.get("cwd", "")
-                session.branch = context.get("branch", "")
+                # A resumed session can start again without its context; keep what is known.
+                session.workspace = context.get("cwd") or data.get("cwd") or session.workspace
+                session.branch = context.get("branch") or session.branch
             elif kind in ("user.message", "assistant.message"):
                 value = text(data.get("content", ""))
                 if kind == "user.message" and value.startswith(("<skill-context", "<system-reminder>")):
                     continue
                 self.add(session, record, kind.split(".")[0], value)
-                for attachment in data.get("attachments", []):
+                for attachment in data.get("attachments") or []:
                     self.add(session, record, "attachment", attachment.get("path", "attachment"), data=attachment)
-                for call in data.get("toolRequests", []):
+                for call in data.get("toolRequests") or []:
                     calls.add(call.get("toolCallId"))
                     self.add(session, record, "tool_call", name=call.get("name"), call_id=call.get("toolCallId"), data={"arguments": call.get("arguments", {})})
             elif kind == "tool.execution_start" and data.get("toolCallId") not in calls:
@@ -623,7 +643,8 @@ def get_adapters(installations, config=None):
     result = {}
     for installation in installations:
         options = dict(config.get("harnesses", {}).get(installation.harness, {}))
-        options.update(next((p for p in config.get("profiles", []) if p.get("name") == installation.profile and p.get("harness") == installation.harness), {}))
+        options.update(next((p for p in config.get("profiles", []) if p.get("name") == installation.profile
+                             and p.get("harness") == installation.harness and p.get("enabled", True)), {}))
         result[installation.endpoint] = BUILTINS[installation.harness](installation, options)
     for name, options in config.get("adapters", {}).items():
         if not re.fullmatch(r"[a-z][a-z0-9_-]*", name) or name in result:

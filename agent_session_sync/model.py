@@ -7,7 +7,7 @@ import uuid
 from dataclasses import asdict, dataclass, field as dataclass_field
 from datetime import datetime, timezone
 
-from .io import SyncError, digest, json_bytes
+from .io import LONE_SURROGATE, SyncError, digest, json_bytes
 
 SCHEMA_VERSION = 1
 MARKER = "[agent-session-sync:v1 "
@@ -72,6 +72,8 @@ class Event:
             raise SyncError("unsupported portable event kind: {}".format(self.kind))
         if not all(isinstance(x, str) for x in (self.id, self.text, self.timestamp, self.name, self.call_id)):
             raise SyncError("portable event text, identifiers, and timestamps must be strings")
+        if any(LONE_SURROGATE.search(x) for x in (self.id, self.text, self.timestamp, self.name, self.call_id)):
+            raise SyncError("portable event text contains a lone surrogate, which UTF-8 cannot encode")
         if not isinstance(self.data, dict):
             raise SyncError("portable event data must be an object")
         instant(self.timestamp)
@@ -99,7 +101,7 @@ class Session:
         self.events = [Event(**e) if isinstance(e, dict) else e for e in self.events]
         self.validate()
         if not self.title:
-            self.title = next((e.text[:100].replace("\n", " ") for e in self.events if e.kind == "user"), self.native_id)
+            self.title = next((e.text[:100].replace("\n", " ") for e in self.events if e.kind == "user" and e.text.strip()), self.native_id)
 
     def validate(self):
         if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
@@ -107,6 +109,9 @@ class Session:
         if not all(isinstance(v, str) for v in (self.harness, self.profile, self.native_id, self.workspace,
                   self.title, self.branch, self.source_path, self.source_sha, self.parent)):
             raise SyncError("portable identity, paths, title, branch, and parent must be strings")
+        if any(LONE_SURROGATE.search(v) for v in (self.harness, self.profile, self.native_id, self.workspace,
+               self.title, self.branch, self.source_path, self.source_sha, self.parent)):
+            raise SyncError("portable session strings contain a lone surrogate, which UTF-8 cannot encode")
         if (not self.native_id.strip() or not re.fullmatch(r"[a-z][a-z0-9_-]*", self.harness)
                 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", self.profile)):
             raise SyncError("invalid portable source identity")

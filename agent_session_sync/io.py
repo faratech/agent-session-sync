@@ -35,8 +35,12 @@ def loads(data):
     if isinstance(data, (bytes, bytearray)):
         # As json.loads does: detect UTF-8/16/32, keeping raw surrogates for scrubbing.
         data = bytes(data).decode(json.detect_encoding(data), "surrogatepass")
-    value = json.loads(data)
-    return scrub(value) if SURROGATE_ESCAPE.search(data) or LONE_SURROGATE.search(data) else value
+    try:
+        value = json.loads(data)
+        return scrub(value) if SURROGATE_ESCAPE.search(data) or LONE_SURROGATE.search(data) else value
+    except RecursionError:
+        # Pathologically nested input is malformed data, not an interpreter failure.
+        raise json.JSONDecodeError("JSON nesting is too deep", data, 0)
 
 
 def workspace_path(value, windows=None):
@@ -108,7 +112,12 @@ def digest(data):
 
 
 def json_bytes(value):
-    return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    try:
+        return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SyncError("value is not valid Unicode (lone surrogate): {}".format(exc))
+    except RecursionError:
+        raise SyncError("value is nested too deeply to serialize")
 
 
 @dataclass(frozen=True)
@@ -206,10 +215,10 @@ def torn_suffix(line):
             continue
         try:
             value, stop = decoder.raw_decode(line, match.start())
-        except ValueError:
+            if stop == end and isinstance(value, dict):
+                return scrub(value) if SURROGATE_ESCAPE.search(line, match.start()) else value
+        except (ValueError, RecursionError):
             continue
-        if stop == end and isinstance(value, dict):
-            return scrub(value) if SURROGATE_ESCAPE.search(line, match.start()) else value
     return None
 
 

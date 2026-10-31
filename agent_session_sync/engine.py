@@ -4,10 +4,11 @@ import copy
 import re
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .adapters import PARSER_VERSION, SessionRef, WORKSPACE_UNKNOWN
-from .io import SyncError, atomic_write, digest, json_bytes, normalized_workspace, resolved_workspace, SharedArtifact, atomic_share
+from .io import SyncError, atomic_write, digest, json_bytes, loads, normalized_workspace, resolved_workspace, SharedArtifact, atomic_share
 from .model import Session, Event, identity, markdown, instant
 from .render import DEFAULT_BUDGET, RENDER_VERSION, compact, jsonl_bytes, native_plan
 from .store import Store
@@ -19,7 +20,8 @@ def event_fingerprint(events):
 
 def prefix_match(selector, key, native_id):
     """Unambiguous-prefix selection over a native id or a full harness:profile:id key."""
-    return native_id.startswith(selector) or key.startswith(selector)
+    # An empty selector is a prefix of everything; it names no session.
+    return bool(selector) and (native_id.startswith(selector) or key.startswith(selector))
 
 
 class Engine:
@@ -69,6 +71,7 @@ class Engine:
             refs = [ref for ref in refs if wanted(source_key(adapter, ref), ref.native_id)]
             if not refs:
                 continue
+            refs, duplicates = self.unique_refs(refs)
             try:
                 # Parses depend on the parser version and on Antigravity's workspace caches.
                 extra = digest(json_bytes([PARSER_VERSION, adapter.options]))
@@ -107,6 +110,9 @@ class Engine:
                     elif hint != session.workspace:
                         self.store.remember_workspace(session, stamp)
                         self.store.db.commit()
+                    if ref.native_id in duplicates:
+                        session.issues = session.issues + ["the same session id is also stored at {}; this newest copy was used".format(
+                            ", ".join(duplicates[ref.native_id]))]
                     raw_session = session
                     session = self.lineage(session)
                     if session and session.workspace and session.workspace != raw_session.workspace:
@@ -117,11 +123,15 @@ class Engine:
                     if project_key and normalized_workspace(session.workspace) != project_key:
                         continue
                     result.append(session)
-                except (SyncError, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                except (SyncError, OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
                     self.errors.append("{}: {}".format(ref.path, exc))
         keys = {s.key for s in result}
+        # Imports have no source file to stat; their newest event dates them.
+        oldest = datetime.fromtimestamp(since, timezone.utc) if days is not None else None
         for session in imports:
             try:
+                if oldest is not None and instant(session.updated) < oldest:
+                    continue
                 if (session.key not in keys and wanted(session.key, session.native_id)
                         and (not harness or harness in (session.harness, session.endpoint))
                         and (not project_key or normalized_workspace(session.workspace) == project_key)):
@@ -129,6 +139,28 @@ class Engine:
             except SyncError as exc:
                 self.errors.append("{}: {}".format(session.key, exc))
         return sorted(result, key=lambda s: (instant(s.updated), s.key), reverse=True)
+
+    @staticmethod
+    def unique_refs(refs):
+        """One ref per native id. Copies of a session (a moved or restored project) share
+        its key, so only the most recently modified copy is read; the others are named."""
+        groups = {}
+        for ref in refs:
+            groups.setdefault(ref.native_id, []).append(ref)
+        if all(len(group) == 1 for group in groups.values()):
+            return refs, {}
+        def modified(ref):
+            try:
+                return Path(ref.path).stat().st_mtime_ns
+            except OSError:
+                return -1
+        chosen, duplicates = set(), {}
+        for native_id, group in groups.items():
+            group = sorted(group, key=lambda ref: (modified(ref), ref.path), reverse=True)
+            chosen.add(id(group[0]))
+            if len(group) > 1:
+                duplicates[native_id] = [ref.path for ref in group[1:]]
+        return [ref for ref in refs if id(ref) in chosen], duplicates
 
     def lineage(self, session):
         provenance = session.provenance
@@ -205,7 +237,7 @@ class Engine:
             transfer = {"archive": str(archive), "source_key": provenance["source_key"], "source_revision": provenance["source_revision"]}
         if transfer:
             try:
-                parent = Session.from_dict(json.loads(Path(transfer["archive"]).read_text(encoding="utf-8-sig")))
+                parent = Session.from_dict(loads(Path(transfer["archive"]).read_bytes()))
                 if parent.key != transfer["source_key"] or parent.revision != transfer.get("source_revision"):
                     raise SyncError("parent archive does not match its pinned identity/revision")
                 note = transfer.get("note", provenance.get("handoff_note", ""))
@@ -223,6 +255,8 @@ class Engine:
         return session
 
     def select(self, selector, project=None):
+        if not isinstance(selector, str) or not selector.strip():
+            raise SyncError("empty session identifier")
         sessions = self.scan(days=None, force=True, selector=selector)
         candidates = [s for s in sessions if selector in (s.key, s.native_id)]
         if not candidates:
@@ -291,7 +325,11 @@ class Engine:
         if "archive" not in serialization:
             if archive.is_file():
                 existing = archive.read_bytes()
-                if Session.from_dict(json.loads(existing)).revision != revision:
+                try:
+                    stored = Session.from_dict(loads(existing))
+                except ValueError as exc:
+                    raise SyncError("corrupt archive {}: {}".format(archive, exc))
+                if stored.revision != revision:
                     raise SyncError("archive identity mismatch: " + str(archive))
                 serialization["archive"] = existing
             else:
@@ -406,7 +444,7 @@ class Engine:
                         continue
                     item, files = self.plan(session, target.endpoint, budget=budget, _revision=revision, _serialization=serialization)
                     results.append(self.apply(item, files))
-                except (OSError, SyncError) as exc:
+                except (OSError, SyncError, ValueError) as exc:
                     self.errors.append("{} -> {}: {}".format(session.key, target.endpoint, exc))
         return results
 
