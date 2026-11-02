@@ -12,6 +12,7 @@ from pathlib import Path
 
 from . import __version__
 from .adapters import SessionRef, get_adapters
+from .blobs import archive_bytes, blob_dir, compact_archives, internalize, read_archive, write_blob
 from .automation import setup, shell_command, settings_path
 from .discovery import discover, load_config, state_dir
 from .engine import Engine
@@ -88,6 +89,8 @@ def parser():
     command = subs.add_parser("prune", parents=[common], help="remove superseded archive snapshots and handoff folders")
     command.add_argument("--keep-days", type=float, default=None,
                          help="keep anything written within this many days (default: retention_days in the config, else 3)")
+    command.add_argument("--compact-store", action="store_true",
+                         help="also move inline images out of older archives and compress the index (one-time conversion)")
     command = subs.add_parser("update", parents=[common], help="update this install and refresh its automation")
     command.add_argument("--ref", default="main")
     command.add_argument("--memories", action="store_true", help=argparse.SUPPRESS)
@@ -219,8 +222,8 @@ def auto_prune(engine, directory, config, args):
         print("agent-session-sync: prune skipped: {}".format(exc), file=sys.stderr)
         return
     if args.verbose and not args.json:
-        print("pruned {} handoff folder(s), {} archive snapshot(s), {:.1f} MB".format(
-            report["handoffs_removed"], report["archives_removed"], report["bytes_freed"] / 1e6), file=sys.stderr)
+        print("pruned {} handoff folder(s), {} archive snapshot(s), {} image blob(s), {:.1f} MB".format(
+            report["handoffs_removed"], report["archives_removed"], report["blobs_removed"], report["bytes_freed"] / 1e6), file=sys.stderr)
 
 
 def execute(args):
@@ -271,7 +274,8 @@ def execute(args):
                     source_sha = session.source_sha
                 else:
                     raw = Path(args.file).read_bytes()
-                    session = Session.from_dict(loads(raw))
+                    # An archive file of either format can be imported; v2 blobs resolve beside it.
+                    session = Session.from_dict(internalize(loads(raw), args.file))
                     source_sha = digest(raw)
                 if args.project:
                     session.workspace = resolved_workspace(args.project)
@@ -280,11 +284,14 @@ def execute(args):
                 if not args.dry_run:
                     archive = engine.archive_path(session)
                     if archive.is_file():
-                        existing = Session.from_dict(loads(archive.read_bytes()))
+                        existing = Session.from_dict(read_archive(archive))
                         if existing.revision != session.revision:
                             raise SyncError("archive identity mismatch: " + str(archive))
                     else:
-                        atomic_write(archive, json_bytes(session.to_dict()))
+                        data, blobs = archive_bytes(session)
+                        for name, blob in blobs.items():
+                            write_blob(blob_dir(archive) / name, blob)
+                        atomic_write(archive, data)
                 emit({"session": session.key, "dry_run": args.dry_run}, args)
             elif args.command in ("handoff", "open"):
                 destination = args.to if args.command == "handoff" else args.harness
@@ -329,9 +336,19 @@ def execute(args):
                 report = prune(engine.store, directory, days, args.dry_run)
                 if not args.dry_run:
                     mark_pruned(engine.store)
-                emit(report if args.json else "{}{} handoff folder(s) and {} archive snapshot(s), {:.1f} MB (kept {} live transfers, retention {} days)".format(
+                text = "{}{} handoff folder(s), {} archive snapshot(s) and {} image blob(s), {:.1f} MB (kept {} live transfers, retention {} days)".format(
                     "Would remove " if args.dry_run else "Removed ", report["handoffs_removed"], report["archives_removed"],
-                    report["bytes_freed"] / 1e6, report["kept_transfers"], days), args)
+                    report["blobs_removed"], report["bytes_freed"] / 1e6, report["kept_transfers"], days)
+                if args.compact_store:
+                    # Runs under the sync lock taken above, so no scheduled sync writes meanwhile.
+                    report.update(compact_archives(directory, args.dry_run))
+                    report.update(engine.store.compact())
+                    text += "\n{}{} archive(s) with inline images ({:.1f} MB -> {:.1f} MB); {} {} index row(s); index {:.1f} MB -> {:.1f} MB".format(
+                        "Would convert " if args.dry_run else "Converted ", report["archives_converted"],
+                        report["archive_bytes_before"] / 1e6, report["archive_bytes_after"] / 1e6,
+                        "would compress" if args.dry_run else "compressed", report["index_rows_compressed"],
+                        report["index_bytes_before"] / 1e6, report["index_bytes_after"] / 1e6)
+                emit(report if args.json else text, args)
             if engine.errors and not args.json:
                 for error in engine.errors:
                     print("agent-session-sync: " + error, file=sys.stderr)

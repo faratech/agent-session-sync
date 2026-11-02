@@ -20,12 +20,20 @@ nothing can use any more, and keeps:
   leave a recent ancestor for an older import someone continues later.
 
 Transfer rows stay in the ledger (they are small); only files are removed.
+
+Images a version 2 archive stores in archives/blobs are removed once no remaining
+archive references them and they are older than SETTLE_SECONDS, so a blob a sync
+has just written for an archive it has not written yet is never collected.
 """
 import json
 import os
 import shutil
 import time
 from pathlib import Path
+
+from .blobs import BLOB_DIR, is_v2, references
+from .io import loads
+from .store import load_document
 
 DEFAULT_RETENTION_DAYS = 3
 # Hourly, so an active conversation's copies never pile up for a day between prunes.
@@ -85,7 +93,7 @@ def live_transfers(store, directory):
     keep = {transfer_id for _, transfer_id in latest.values()}
     for (document,) in store.db.execute("SELECT document FROM sessions"):
         try:
-            session = json.loads(document)
+            session = load_document(document)
         except ValueError:
             continue
         provenance = session.get("provenance") if isinstance(session, dict) else None
@@ -140,7 +148,7 @@ def prune(store, directory, retention_days=DEFAULT_RETENTION_DAYS, dry_run=False
     pinned = {os.path.normpath(transfers[t]["archive"]) for t in keep | recent
               if t in transfers and transfers[t].get("archive")}
     report = {"retention_days": retention_days, "dry_run": dry_run, "kept_transfers": len(keep),
-              "handoffs_removed": 0, "archives_removed": 0, "bytes_freed": 0}
+              "handoffs_removed": 0, "archives_removed": 0, "blobs_removed": 0, "blob_bytes_freed": 0, "bytes_freed": 0}
 
     handoffs = directory / "handoffs"
     if handoffs.is_dir():
@@ -156,9 +164,10 @@ def prune(store, directory, retention_days=DEFAULT_RETENTION_DAYS, dry_run=False
                 shutil.rmtree(folder, ignore_errors=True)
 
     archives = directory / "archives"
+    removed = set()
     if archives.is_dir():
         for conversation in archives.iterdir():
-            if not conversation.is_dir():
+            if conversation.name == BLOB_DIR or not conversation.is_dir():
                 continue
             snapshots = [p for p in conversation.glob("*.json") if p.is_file()]
             if not snapshots:
@@ -173,13 +182,49 @@ def prune(store, directory, retention_days=DEFAULT_RETENTION_DAYS, dry_run=False
                 readable = snapshot.with_suffix(".md")
                 report["bytes_freed"] += _freed(snapshot) + _freed(readable)
                 report["archives_removed"] += 1
+                removed.add(snapshot)
                 if not dry_run:
                     for path in (snapshot, readable):
                         try:
                             path.unlink()
                         except FileNotFoundError:
                             pass
+        collect_blobs(archives, removed, settle, dry_run, report)
     return report
+
+
+def collect_blobs(archives, removed, settle, dry_run, report):
+    """Remove settled blobs that no remaining archive references."""
+    folder = archives / BLOB_DIR
+    if not folder.is_dir():
+        return
+    referenced = set()
+    for snapshot in archives.glob("*/*.json"):
+        if snapshot.parent.name == BLOB_DIR or snapshot in removed:
+            continue
+        try:
+            if is_v2(snapshot):
+                referenced |= references(loads(snapshot.read_bytes()))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            # An archive that cannot be read might reference anything; collect nothing.
+            return
+    for blob in folder.iterdir():
+        if blob.name in referenced or blob.name.startswith(".") or not blob.is_file():
+            continue
+        written = _mtime(blob)
+        if written is None or written >= settle:
+            continue
+        size = _freed(blob)
+        report["blobs_removed"] += 1
+        report["blob_bytes_freed"] += size
+        report["bytes_freed"] += size
+        if not dry_run:
+            try:
+                blob.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def due(store, now=None, interval=PRUNE_INTERVAL_SECONDS):

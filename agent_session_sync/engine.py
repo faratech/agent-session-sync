@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .adapters import PARSER_VERSION, SessionRef, WORKSPACE_UNKNOWN
+from .blobs import Blob, archive_bytes, blob_dir, internalize, read_archive, write_blob
 from .io import SyncError, atomic_write, digest, json_bytes, loads, normalized_workspace, resolved_workspace, SharedArtifact, atomic_share
 from .model import Session, Event, identity, markdown, instant
 from .render import DEFAULT_BUDGET, RENDER_VERSION, compact, jsonl_bytes, native_plan
@@ -262,7 +263,7 @@ class Engine:
             transfer = {"archive": str(archive), "source_key": provenance["source_key"], "source_revision": provenance["source_revision"]}
         if transfer:
             try:
-                parent = Session.from_dict(loads(Path(transfer["archive"]).read_bytes()))
+                parent = Session.from_dict(read_archive(transfer["archive"]))
                 if parent.key != transfer["source_key"] or parent.revision != transfer.get("source_revision"):
                     raise SyncError("parent archive does not match its pinned identity/revision")
                 note = transfer.get("note", provenance.get("handoff_note", ""))
@@ -348,23 +349,28 @@ class Engine:
             serialization.clear()
             serialization["identity"] = (session.key, revision)
         if "archive" not in serialization:
+            data, blobs = archive_bytes(session)
             if archive.is_file():
                 existing = archive.read_bytes()
-                try:
-                    stored = Session.from_dict(loads(existing))
-                except ValueError as exc:
-                    raise SyncError("corrupt archive {}: {}".format(archive, exc))
-                if stored.revision != revision:
-                    raise SyncError("archive identity mismatch: " + str(archive))
-                serialization["archive"] = existing
-            else:
-                serialization["archive"] = json_bytes(session.to_dict())
+                if existing != data:
+                    # An archive in another format (or an earlier writer's) is kept when it holds this revision.
+                    try:
+                        stored = Session.from_dict(internalize(loads(existing), archive))
+                    except ValueError as exc:
+                        raise SyncError("corrupt archive {}: {}".format(archive, exc))
+                    if stored.revision != revision:
+                        raise SyncError("archive identity mismatch: " + str(archive))
+                    data, blobs = existing, {}
+            serialization["archive"] = data
+            serialization["blobs"] = {str(blob_dir(archive) / name): blob for name, blob in blobs.items()}
         if "markdown" not in serialization:
             serialization["markdown"] = markdown(session).encode("utf-8")
         readable = archive.with_suffix(".md")
-        files = {str(archive): serialization["archive"], str(readable): serialization["markdown"],
-                 str(folder / "transcript.md"): SharedArtifact(readable, serialization["markdown"]),
-                 str(folder / "context.md"): context.encode("utf-8")}
+        # Blobs come first, so an archive never names a blob that is not written yet.
+        files = dict(serialization.get("blobs", {}))
+        files.update({str(archive): serialization["archive"], str(readable): serialization["markdown"],
+                      str(folder / "transcript.md"): SharedArtifact(readable, serialization["markdown"]),
+                      str(folder / "context.md"): context.encode("utf-8")})
         if native:
             old = self.store.legacy_target(session.source_path, destination)
             target, sid, records = native_plan(session, adapter, transfer_id, context, revision=revision, note=note)
@@ -391,6 +397,9 @@ class Engine:
         for path, data in files.items():
             if isinstance(data, SharedArtifact):
                 atomic_share(data.source, path, data.data)
+                continue
+            if isinstance(data, Blob):
+                write_blob(path, data)
                 continue
             expected = None
             target = path == item.get("target")

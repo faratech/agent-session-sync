@@ -132,7 +132,7 @@ snapshot is idempotent; the `imported-` profile prefix is reserved.
 
 Each handoff contains `context.md` (bounded recent context), `transcript.md`
 (complete portable conversation), `manifest.json` (provenance and fidelity
-notices), and a pinned version 1 JSON archive. Context includes the original
+notices), and a pinned JSON archive (see [Archive format](#archive-format)). Context includes the original
 request excerpt, workspace metadata, recent turns, and an optional note.
 Destinations share the archived readable transcript through hard links where
 supported, with a guarded copy fallback on other filesystems.
@@ -230,13 +230,42 @@ Override state with `AGENT_SESSION_SYNC_STATE_DIR` or `--state-dir`. Defaults:
 (otherwise `~/.local/state/...`) for other POSIX users;
 `%LOCALAPPDATA%\agent-session-sync` for Windows.
 
-`sessions.sqlite3` holds the index and transfer ledger. Archives and handoffs are
-ordinary local files. The v1 `state.json` is backed up as `state-v1.json.bak`
+`sessions.sqlite3` holds the index and transfer ledger. Session documents larger
+than 4 KB are stored zlib-compressed in it (index version 3; older releases refuse
+the file rather than misread it). Archives and handoffs are ordinary local files. The v1 `state.json` is backed up as `state-v1.json.bak`
 before migration. Registered legacy files and IDs remain intact; new native
 handoffs use independent snapshots, so a live legacy continuation is never
 replaced during migration. Keep archives and the ledger together to preserve
 lineage. Project-scoped scans use workspace hints to avoid decoding unrelated
 cached histories; completed transfers repair missing generated artifacts.
+
+### Archive format
+
+An archive is `archives/<conversation>/<revision>.json`, the complete portable
+session (schema version 1), with a readable `.md` beside it. Conversations with
+screenshots used to repeat the same base64 images in every snapshot, so archive
+format version 2 stores each inline `data:image/...;base64,` string of 64 KB or
+more once, as the decoded image file `archives/blobs/<sha256>.<ext>`, and puts the
+blob's path relative to the archive file where the string was. A top-level
+`blobs` list names every replaced value:
+
+```json
+{
+  "archive_version": 2,
+  "blobs": [{"path": ["events", 3, "data", "output", 1, "image_url"],
+             "file": "../blobs/<sha256>.png",
+             "prefix": "data:image/png;base64,",
+             "sha256": "<sha256>"}],
+  "events": [...],
+  "schema_version": 1
+}
+```
+
+To restore the session, replace each listed value with `prefix` plus the base64 of
+the file; only listed paths are references. An archive without such images is
+written exactly as version 1, and version 1 archives still load. A missing or
+changed blob is an error. `import` accepts either format and resolves blobs beside
+the file given. The `.md` transcripts are unchanged.
 
 ### Retention
 
@@ -249,7 +278,8 @@ removed. These are always kept:
 - any transfer a conversation was continued from (its continuation is rebuilt
   from that parent archive);
 - the transfer the current inbox pointer names;
-- the newest snapshot of every conversation.
+- the newest snapshot of every conversation;
+- every image blob a remaining archive references.
 
 Everything else goes once it is older than `retention_days` (default 3). Inside
 that window everything from the last hour stays. Before that, only the newest
@@ -261,7 +291,15 @@ to `0` to turn automatic pruning off. To prune by hand:
 ```sh
 agent-session-sync prune --dry-run          # report what would be removed
 agent-session-sync prune --keep-days 7      # remove copies older than 7 days
+agent-session-sync prune --compact-store    # also convert older archives and compress the index
 ```
+
+`--compact-store` is a one-time conversion for state written by earlier releases.
+Under the sync lock it rewrites version 1 archives that inline large images as
+version 2 (checking that each restores the same session, and keeping its
+modification time), compresses large index rows, and runs `VACUUM`. New archives
+and rows are written compactly without it. Image blobs no archive references are
+removed by prune once they are an hour old.
 
 Sync also stops writing new handoffs when the state directory's disk has less
 than `min_free_gb` free (default 5; `0` turns the check off). It reports a

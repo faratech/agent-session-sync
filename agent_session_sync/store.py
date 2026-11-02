@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import time
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -11,6 +12,36 @@ from .model import Session, imported_snapshot
 
 APPLICATION_ID = 0x41535359
 BACKUP_BUSY_TIMEOUT = 5.0
+# Index version 3 stores large session documents zlib-compressed. Older builds refuse it
+# instead of misreading those rows.
+INDEX_VERSION = 3
+COMPRESS_OVER = 4096
+COMPRESSED = b"z1:"
+
+
+def encode_document(text):
+    """A sessions.document value: plain JSON text, or z1:-prefixed zlib when larger than COMPRESS_OVER."""
+    data = text.encode("utf-8")
+    if len(data) <= COMPRESS_OVER:
+        return text
+    return sqlite3.Binary(COMPRESSED + zlib.compress(data, 6))
+
+
+def decode_document(value):
+    """JSON text or bytes for a sessions.document value of either encoding (raises ValueError when corrupt)."""
+    if isinstance(value, memoryview):
+        value = bytes(value)
+    if isinstance(value, bytes) and value.startswith(COMPRESSED):
+        try:
+            return zlib.decompress(value[len(COMPRESSED):])
+        except zlib.error as exc:
+            raise ValueError("corrupt compressed session document: {}".format(exc))
+    return value
+
+
+def load_document(value):
+    """The parsed session document stored in a sessions row."""
+    return loads(decode_document(value))
 
 
 @contextmanager
@@ -94,7 +125,7 @@ class Store:
         if application_id not in (0, APPLICATION_ID):
             raise SyncError("selected SQLite file belongs to another application")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2):
+        if version not in (0, 1, 2, INDEX_VERSION):
             raise SyncError("unsupported index version: {}".format(version))
         tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
         if application_id == 0 and tables:
@@ -119,14 +150,14 @@ class Store:
             with self.db:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN imported INTEGER NOT NULL DEFAULT 0")
                 for row in self.db.execute("SELECT key, document FROM sessions").fetchall():
-                    document = loads(row[1])
-                    if isinstance(document, dict) and isinstance(document.get("provenance"), dict) and document["provenance"].get("portable_import"):
+                    parsed = load_document(row[1])
+                    if isinstance(parsed, dict) and isinstance(parsed.get("provenance"), dict) and parsed["provenance"].get("portable_import"):
                         self.db.execute("UPDATE sessions SET imported=1 WHERE key=?", (row[0],))
         self.db.executescript("""
             CREATE INDEX IF NOT EXISTS sessions_imported ON sessions(imported) WHERE imported=1;
             CREATE INDEX IF NOT EXISTS transfers_route ON transfers(source_key, destination);
-            PRAGMA user_version=2;
         """)
+        self.db.execute("PRAGMA user_version=" + str(INDEX_VERSION))
         self.db.execute("PRAGMA application_id=" + str(APPLICATION_ID))
         self.migrate_legacy()
         self.migrate_import_namespace()
@@ -142,7 +173,7 @@ class Store:
                     self.db.execute("UPDATE sessions SET imported=0 WHERE key=?", (key,))
                     continue
                 try:
-                    session = imported_snapshot(Session.from_dict(loads(row["document"])))
+                    session = imported_snapshot(Session.from_dict(load_document(row["document"])))
                 except (SyncError, ValueError) as exc:
                     raise SyncError("cannot migrate portable import {}: {}".format(key, exc))
                 self.write_session(session, None, True)
@@ -181,7 +212,7 @@ class Store:
                               (key, path, json.dumps(stat))).fetchone()
         if row:
             try:
-                value = loads(row[0])
+                value = load_document(row[0])
                 return value if isinstance(value, dict) else None
             except ValueError:
                 pass
@@ -202,7 +233,7 @@ class Store:
     def write_session(self, session, stat, imported):
         session.validate()
         self.db.execute("INSERT OR REPLACE INTO sessions (key, source_path, stat, document, imported) VALUES (?, ?, ?, ?, ?)",
-                        (session.key, session.source_path, json.dumps(stat), json.dumps(session.to_dict()), int(imported)))
+                        (session.key, session.source_path, json.dumps(stat), encode_document(json.dumps(session.to_dict())), int(imported)))
         self.remember_workspace(session, stat)
 
     def remember(self, session, stat=None, imported=False):
@@ -214,7 +245,28 @@ class Store:
 
     def sessions(self, imported_only=False):
         query = "SELECT document FROM sessions" + (" WHERE imported=1" if imported_only else "")
-        return [loads(row[0]) for row in self.db.execute(query)]
+        return [load_document(row[0]) for row in self.db.execute(query)]
+
+    def compact(self):
+        """Compress every large session row still stored as text, then VACUUM. Documents are kept verbatim."""
+        page = self.db.execute("PRAGMA page_size").fetchone()[0]
+        before = self.db.execute("PRAGMA page_count").fetchone()[0] * page
+        rewritten = 0
+        keys = [row[0] for row in self.db.execute("SELECT key FROM sessions WHERE typeof(document)='text'")]
+        with self.db:
+            for key in keys:
+                # One row at a time: the documents together can be far larger than memory should hold.
+                row = self.db.execute("SELECT document FROM sessions WHERE key=?", (key,)).fetchone()
+                if row is None or not isinstance(row[0], str):
+                    continue
+                encoded = encode_document(row[0])
+                if not isinstance(encoded, str):
+                    self.db.execute("UPDATE sessions SET document=? WHERE key=?", (encoded, key))
+                    rewritten += 1
+        if not self.dry_run:
+            self.db.execute("VACUUM")
+        after = self.db.execute("PRAGMA page_count").fetchone()[0] * page
+        return {"index_rows_compressed": rewritten, "index_bytes_before": before, "index_bytes_after": after}
 
     def transfer(self, transfer_id):
         row = self.db.execute("SELECT document FROM transfers WHERE id=?", (transfer_id,)).fetchone()

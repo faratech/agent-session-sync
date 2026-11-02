@@ -158,7 +158,7 @@ class ReviewRegressions(Workspace):
         store = Store(directory)
         self.addCleanup(store.close)
         self.assertEqual([s["harness"] for s in store.sessions(imported_only=True)], ["muse"])
-        self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 3)
 
 
 class SecondPassRegressions(Workspace):
