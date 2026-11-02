@@ -242,7 +242,7 @@ cached histories; completed transfers repair missing generated artifacts.
 
 Each time a conversation changes, sync writes a complete new archive snapshot and
 one handoff folder per destination. Older copies are pruned automatically, at
-most once a day, after a scheduled sync. Only files nothing can use are
+most once an hour, after a scheduled sync. Only files nothing can use are
 removed. These are always kept:
 
 - the newest transfer of every source/destination route;
@@ -251,14 +251,21 @@ removed. These are always kept:
 - the transfer the current inbox pointer names;
 - the newest snapshot of every conversation.
 
-Everything else goes once it is older than `retention_days` (default 3). Set the
-key in the config file to change the window, or set it to `0` to turn
-automatic pruning off. To prune by hand:
+Everything else goes once it is older than `retention_days` (default 3). Inside
+that window everything from the last hour stays. Before that, only the newest
+transfer of each route in each 6-hour block stays. An active conversation is
+copied every few minutes, so keeping every copy for days lets one long session
+fill a disk. Set `retention_days` in the config file to change the window, or set it
+to `0` to turn automatic pruning off. To prune by hand:
 
 ```sh
 agent-session-sync prune --dry-run          # report what would be removed
 agent-session-sync prune --keep-days 7      # remove copies older than 7 days
 ```
+
+Sync also stops writing new handoffs when the state directory's disk has less
+than `min_free_gb` free (default 5; `0` turns the check off). It reports a
+"low disk space" error instead of filling the disk.
 
 Transfer records stay in `sessions.sqlite3`. A pruned handoff is never re-rendered,
 because the next sync only checks each route's newest transfer.

@@ -11,7 +11,9 @@ from test_sync import Workspace
 from agent_session_sync import cli
 from agent_session_sync.adapters import SessionRef
 from agent_session_sync.io import read_records
-from agent_session_sync.prune import DEFAULT_RETENTION_DAYS, due, mark_pruned, prune, retention_from
+from agent_session_sync import engine as engine_module
+from agent_session_sync.prune import (DEFAULT_RETENTION_DAYS, PRUNE_INTERVAL_SECONDS, SETTLE_SECONDS,
+                                       THIN_BUCKET_SECONDS, due, mark_pruned, prune, retention_from)
 
 DAY = 86400
 
@@ -25,10 +27,16 @@ def age(paths, days):
 
 
 def age_transfer(state, item, days):
+    stamp_transfer(item, time.time() - days * DAY)
+
+
+def stamp_transfer(item, stamp):
     folder = Path(item["context"]).parent
     archive = Path(item["archive"])
     targets = [item["target"]] if item.get("target") else []
-    age([p for p in folder.rglob("*")] + [folder, archive, archive.with_suffix(".md")] + targets, days)
+    for path in [p for p in folder.rglob("*")] + [folder, archive, archive.with_suffix(".md")] + targets:
+        if Path(path).exists():
+            os.utime(path, (stamp, stamp))
 
 
 class PruneTests(Workspace):
@@ -119,6 +127,69 @@ class PruneTests(Workspace):
         self.assertFalse(older.exists())
         self.assertTrue(newer.is_file() and newer.with_suffix(".md").is_file())
 
+    def revisions(self, engine, count):
+        items = [engine.handoff(self.read("codex"), "claude")]
+        for n in range(count - 1):
+            items.append(engine.handoff(self.grow("codex", "Turn {}.".format(n)), "claude"))
+        self.assertEqual(len({i["source_revision"] for i in items}), count)
+        return items
+
+    def gone(self, item):
+        return not Path(item["context"]).parent.exists() and not Path(item["archive"]).exists()
+
+    def test_an_active_conversation_is_thinned_inside_the_retention_window(self):
+        # A long session is re-snapshotted every few minutes; keeping every copy for the whole
+        # window let one conversation fill a disk. Past the settle hour, one per route per bucket stays.
+        engine = self.engine()
+        items = self.revisions(engine, 4)
+        base = (int(time.time()) // THIN_BUCKET_SECONDS - 8) * THIN_BUCKET_SECONDS + 100
+        for offset, item in zip((0, 60, 120, 3 * 3600), items):
+            stamp_transfer(item, base + offset)
+        report = prune(engine.store, self.state, 7, now=base + 2 * DAY)
+        self.assertTrue(all(self.gone(i) for i in items[:3]), "older copies in the same bucket are removed")
+        self.assertTrue(Path(items[3]["archive"]).is_file())
+        self.assertTrue(engine.complete(engine.store.transfer(items[3]["id"])), "the newest transfer stays complete")
+        self.assertEqual(report["archives_removed"], 3)
+
+    def test_each_bucket_keeps_its_newest_copy(self):
+        engine = self.engine()
+        items = self.revisions(engine, 3)
+        base = (int(time.time()) // THIN_BUCKET_SECONDS - 8) * THIN_BUCKET_SECONDS + 100
+        for offset, item in zip((0, THIN_BUCKET_SECONDS, THIN_BUCKET_SECONDS + 60), items):
+            stamp_transfer(item, base + offset)
+        prune(engine.store, self.state, 7, now=base + DAY)
+        self.assertFalse(self.gone(items[0]), "the only copy in the earlier bucket stays")
+        self.assertTrue(self.gone(items[1]))
+        self.assertFalse(self.gone(items[2]))
+
+    def test_the_settle_hour_is_never_thinned(self):
+        engine = self.engine()
+        items = self.revisions(engine, 3)
+        now = time.time()
+        for offset, item in zip((300, 200, 100), items):
+            stamp_transfer(item, now - offset)
+        report = prune(engine.store, self.state, 7, now=now)
+        self.assertLess(300, SETTLE_SECONDS)
+        self.assertEqual((report["handoffs_removed"], report["archives_removed"]), (0, 0))
+
+    def test_automatic_prune_is_hourly(self):
+        self.assertLessEqual(PRUNE_INTERVAL_SECONDS, 3600)
+        store = self.engine().store
+        mark_pruned(store, now=time.time() - PRUNE_INTERVAL_SECONDS - 1)
+        self.assertTrue(due(store))
+
+    def test_sync_writes_nothing_when_the_disk_is_nearly_full(self):
+        engine = self.engine()
+        with mock.patch.object(engine_module, "free_bytes", return_value=10 ** 9):
+            self.assertEqual(engine.sync(destination="claude"), [])
+        self.assertTrue(any("low disk space" in e for e in engine.errors))
+        self.assertFalse(any((self.state / "handoffs").glob("*")) if (self.state / "handoffs").exists() else False)
+        engine.config["min_free_gb"] = 0
+        with mock.patch.object(engine_module, "free_bytes", return_value=0):
+            self.assertTrue(engine.sync(destination="claude"), "min_free_gb: 0 disables the guard")
+        self.assertEqual(engine_module.min_free_bytes({}), 5 * 10 ** 9)
+        self.assertEqual(engine_module.min_free_bytes({"min_free_gb": 12}), 12 * 10 ** 9)
+
     def test_dry_run_reports_and_removes_nothing(self):
         engine = self.engine()
         first, second = self.two_revisions(engine)
@@ -145,7 +216,7 @@ class PruneTests(Workspace):
                                {"handoffs_removed": 0, "archives_removed": 0, "bytes_freed": 0}):
             cli.auto_prune(engine, self.state, {}, args)
             cli.auto_prune(engine, self.state, {}, args)
-        self.assertEqual(len(calls), 1, "a second run inside the day does not prune again")
+        self.assertEqual(len(calls), 1, "a second run inside the interval does not prune again")
         self.assertFalse(due(engine.store))
         mark_pruned(engine.store, now=time.time() - 2 * DAY)
         stderr = io.StringIO()

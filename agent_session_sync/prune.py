@@ -11,8 +11,13 @@ nothing can use any more, and keeps:
 - every transfer a conversation was continued from: Engine.lineage() rebuilds a
   continuation from the parent archive its transfer pins;
 - every transfer an inbox pointer names;
-- anything written within the retention window, and the newest snapshot of
-  every conversation, so each conversation keeps one portable archive.
+- the newest snapshot of every conversation, so each conversation keeps one
+  portable archive;
+- inside the retention window, everything written in the last SETTLE_SECONDS
+  and, before that, the newest transfer of each route per THIN_BUCKET_SECONDS.
+  An active conversation is re-snapshotted every few minutes, and keeping every
+  copy for days let a single long session fill a disk; the thinned copies still
+  leave a recent ancestor for an older import someone continues later.
 
 Transfer rows stay in the ledger (they are small); only files are removed.
 """
@@ -23,7 +28,11 @@ import time
 from pathlib import Path
 
 DEFAULT_RETENTION_DAYS = 3
-PRUNE_INTERVAL_SECONDS = 86400
+# Hourly, so an active conversation's copies never pile up for a day between prunes.
+PRUNE_INTERVAL_SECONDS = 3600
+# Inside the retention window: keep all of the last hour, then one transfer per route per 6 hours.
+SETTLE_SECONDS = 3600
+THIN_BUCKET_SECONDS = 6 * 3600
 LAST_PRUNE_KEY = "last_prune"
 # A native target touched after its manifest was written has been continued.
 TOUCH_SLACK_SECONDS = 60
@@ -59,7 +68,7 @@ def _baseline(provenance, transfer):
 def live_transfers(store, directory):
     """Transfer ids whose artifacts must stay, and the parsed ledger."""
     directory = Path(directory)
-    transfers, latest = {}, {}
+    transfers, latest, routes = {}, {}, {}
     for rowid, transfer_id, source_key, destination, document in store.db.execute(
             "SELECT rowid, id, source_key, destination, document FROM transfers"):
         try:
@@ -70,6 +79,7 @@ def live_transfers(store, directory):
             continue
         transfers[transfer_id] = item
         route = (source_key, destination)
+        routes[transfer_id] = route
         if route not in latest or rowid > latest[route][0]:
             latest[route] = (rowid, transfer_id)
     keep = {transfer_id for _, transfer_id in latest.values()}
@@ -101,7 +111,7 @@ def live_transfers(store, directory):
                 continue
             if isinstance(value, dict) and value.get("id"):
                 keep.add(value["id"])
-    return keep, transfers
+    return keep, transfers, routes
 
 
 def prune(store, directory, retention_days=DEFAULT_RETENTION_DAYS, dry_run=False, now=None):
@@ -111,10 +121,22 @@ def prune(store, directory, retention_days=DEFAULT_RETENTION_DAYS, dry_run=False
     directory = Path(directory)
     now = time.time() if now is None else now
     cutoff = now - float(retention_days) * 86400
-    keep, transfers = live_transfers(store, directory)
-    # A transfer written inside the window may still be continued, so its parent archive stays too.
-    recent = {t for t, item in transfers.items()
-              if (_mtime(directory / "handoffs" / t / "manifest.json") or 0) >= cutoff}
+    keep, transfers, routes = live_transfers(store, directory)
+    settle = now - SETTLE_SECONDS
+    # A transfer written inside the window may still be continued, so it and its parent archive stay,
+    # thinned to the newest per route per bucket once it is past the settle period.
+    recent, newest_in_bucket = set(), {}
+    for t in transfers:
+        written = _mtime(directory / "handoffs" / t / "manifest.json")
+        if written is None or written < cutoff:
+            continue
+        if written >= settle:
+            recent.add(t)
+            continue
+        bucket = (routes.get(t), int(written // THIN_BUCKET_SECONDS))
+        if bucket not in newest_in_bucket or written > newest_in_bucket[bucket][0]:
+            newest_in_bucket[bucket] = (written, t)
+    recent.update(t for _, t in newest_in_bucket.values())
     pinned = {os.path.normpath(transfers[t]["archive"]) for t in keep | recent
               if t in transfers and transfers[t].get("archive")}
     report = {"retention_days": retention_days, "dry_run": dry_run, "kept_transfers": len(keep),
@@ -123,10 +145,10 @@ def prune(store, directory, retention_days=DEFAULT_RETENTION_DAYS, dry_run=False
     handoffs = directory / "handoffs"
     if handoffs.is_dir():
         for folder in handoffs.iterdir():
-            if not folder.is_dir() or folder.name in keep:
+            if not folder.is_dir() or folder.name in keep or folder.name in recent:
                 continue
             written = _mtime(folder / "manifest.json") or _mtime(folder)
-            if written is None or written >= cutoff:
+            if written is None or written >= settle:
                 continue
             report["bytes_freed"] += sum(_freed(p) for p in folder.rglob("*") if p.is_file())
             report["handoffs_removed"] += 1
@@ -146,7 +168,7 @@ def prune(store, directory, retention_days=DEFAULT_RETENTION_DAYS, dry_run=False
                 if snapshot == newest or os.path.normpath(str(snapshot)) in pinned:
                     continue
                 written = _mtime(snapshot)
-                if written is None or written >= cutoff:
+                if written is None or written >= settle:
                     continue
                 readable = snapshot.with_suffix(".md")
                 report["bytes_freed"] += _freed(snapshot) + _freed(readable)

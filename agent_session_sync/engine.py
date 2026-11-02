@@ -2,6 +2,7 @@
 import json
 import copy
 import re
+import shutil
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -22,6 +23,30 @@ def prefix_match(selector, key, native_id):
     """Unambiguous-prefix selection over a native id or a full harness:profile:id key."""
     # An empty selector is a prefix of everything; it names no session.
     return bool(selector) and (native_id.startswith(selector) or key.startswith(selector))
+
+
+DEFAULT_MIN_FREE_GB = 5
+
+
+def min_free_bytes(config):
+    """Free space below which sync writes no new handoffs (config min_free_gb; 0 or false disables)."""
+    value = (config or {}).get("min_free_gb", DEFAULT_MIN_FREE_GB)
+    if value is None or value is False:
+        return 0
+    try:
+        return max(0, int(float(value) * 1e9))
+    except (TypeError, ValueError):
+        return int(DEFAULT_MIN_FREE_GB * 1e9)
+
+
+def free_bytes(directory):
+    path = Path(directory)
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    try:
+        return shutil.disk_usage(str(path)).free
+    except OSError:
+        return float("inf")
 
 
 class Engine:
@@ -424,7 +449,12 @@ class Engine:
             raise SyncError("unknown destination: " + destination)
         # One current source per project/destination prevents a context inbox from replaying old tasks.
         context_seen = set()
+        floor = min_free_bytes(self.config)
         for session in sessions:
+            if floor and not self.dry_run and free_bytes(self.directory) < floor:
+                self.errors.append("low disk space: under {:.1f} GB free at {}; skipped the remaining handoffs".format(
+                    floor / 1e9, self.directory))
+                break
             source_endpoint = session.endpoint
             if not session.workspace:
                 self.errors.append("{}: workspace unknown; skipped automatic handoff".format(session.key))
