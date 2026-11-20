@@ -247,7 +247,7 @@ def read_records(path):
             if found is None:
                 # Power loss can also leave NUL padding where the rest of the record should be.
                 cut_short = exc.msg.startswith("Unterminated string") or exc.pos >= len(line.rstrip(" \t\r\x00")) \
-                    or cut_in_token(line, exc.pos)
+                    or cut_in_token(line, exc.pos) or cut_in_escape(line, exc)
                 if not cut_short or truncated is not None:
                     raise SyncError("invalid JSON at {}:{}: {}".format(path, index + 1, exc))
                 # A crash can cut a record short; it is skipped only once the writer is seen to continue.
@@ -275,9 +275,17 @@ def find_program(name):
         cwd = None  # a removed directory cannot hold a planted program
     extensions = [""]
     if os.name == "nt":
-        extensions += [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
+        # As shutil.which: the bare name only when it already carries an executable extension.
+        pathext = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
+        extensions = ([""] if any(name.upper().endswith(e.upper()) for e in pathext) else []) + pathext
     for entry in os.environ.get("PATH", "").split(os.pathsep):
-        if not entry or not os.path.isabs(entry) or cwd is not None and os.path.normcase(os.path.realpath(entry)) == cwd:
+        if not entry or not os.path.isabs(entry):
+            continue
+        try:
+            resolved = os.path.normcase(os.path.realpath(entry))
+        except OSError:
+            resolved = os.path.normcase(os.path.abspath(entry))  # unreachable (a network share): compare as written
+        if cwd is not None and resolved == cwd:
             continue
         for extension in extensions:
             candidate = os.path.join(entry, name + extension)
@@ -371,6 +379,12 @@ def appended_matches(path, start, pattern, chunk=1 << 20):
 PARTIAL_TOKEN = re.compile(r'(?:t(?:ru?)?|f(?:a(?:ls?)?)?|n(?:ul?)?|-?\d*(?:\.\d*)?(?:[eE][-+]?\d*)?|"(?:[^"\\]|\\.)*\\u[0-9a-fA-F]{0,3})')
 
 
+def cut_in_escape(line, exc):
+    """Whether a JSON error is a record cut inside a \\uXXXX escape (whatever the string held before)."""
+    return exc.msg.startswith("Invalid \\uXXXX escape") and \
+        re.fullmatch(r"\\?u[0-9a-fA-F]{0,3}", line.rstrip(" \t\r\x00")[exc.pos:]) is not None
+
+
 def cut_in_token(line, position):
     """Whether a JSON error at position is a record cut inside its final token."""
     text = line.rstrip(" \t\r\x00")
@@ -388,11 +402,28 @@ def torn_suffix(line, after=1):
     another writer, unscrubbed; None when there is none."""
     end = len(line.rstrip(" \t\r"))
     decoder = json.JSONDecoder()
+    absorbed = None  # whether the cut record parses to the end of the line (computed once, if needed)
     for match in re.finditer(r'\{\s*"', line):
         if match.start() < after:
             continue
-        if line[:match.start()].rstrip(" \t\r\x00").endswith((":", ",", "[")):
-            continue  # a value inside the cut record, not a record of its own
+        before = match.start() - 1
+        while before >= 0 and line[before] in " \t\r\x00":
+            before -= 1
+        if before >= 0 and line[before] in ":,[":
+            # After ':' ',' or '[' an object may be a value inside the cut record: it is one only
+            # when the cut record is a valid JSON prefix up to the end of the line (a cut inside a
+            # string, or after an object's comma, cannot end in a value).
+            if absorbed is None:
+                first = line.find("{", max(after - 1, 0))
+                try:
+                    decoder.raw_decode(line, first if first >= 0 else 0)
+                    absorbed = False
+                except ValueError as exc:
+                    absorbed = getattr(exc, "pos", -1) >= end
+                except RecursionError:
+                    absorbed = False
+            if absorbed:
+                continue
         try:
             value, stop = decoder.raw_decode(line, match.start())
             if stop == end and isinstance(value, dict):

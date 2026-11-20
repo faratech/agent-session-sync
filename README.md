@@ -367,14 +367,17 @@ directory is gone (an unmounted or moved home).
 Codex compresses cold rollouts into `rollout-*.jsonl.zst`. These are read with
 Python 3.14's `compression.zstd`, the `zstandard` package, or the `zstd` command.
 Without any of these, compressed rollouts are skipped. An import you archive in
-Codex counts as present and is not written back.
+Codex counts as present and is not written back, including after an upgrade that
+renders imports differently. When Codex compresses a rollout this tool has already
+read, the earlier parse is reused instead of decompressing it again.
 A compressed import counts as present, so it is never written again. Earlier
 releases did write some back beside the compressed copy. Prune removes such a plain
 copy while it still holds exactly what sync wrote; the compressed file always stays.
 
-Sync also stops writing new handoffs when the state directory's disk has less
-than `min_free_gb` free (default 5; `0` turns the check off). It reports a
-"low disk space" error instead of filling the disk.
+Sync and the start hook's injection stop writing new handoffs when the state
+directory's disk has less than `min_free_gb` free (default 5; `0` turns the check
+off). They report a "low disk space" error instead of filling the disk. An injection
+that already exists is still served.
 
 Transfer records stay in `sessions.sqlite3`. A pruned handoff is never re-rendered,
 because the next sync only checks each route's newest transfer.

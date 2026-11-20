@@ -22,7 +22,7 @@ from .io import SyncError, atomic_write, json_bytes, loads, normalized_workspace
 from .model import Session, markdown, imported_snapshot
 from .prune import DEFAULT_RETENTION_DAYS, due as prune_due, mark_pruned, native_from, prune, retention_from
 from .render import DEFAULT_BUDGET
-from .store import Busy, add_pending, has_pending, single_flight, take_pending
+from .store import Busy, add_pending, has_pending, has_takeable, single_flight, take_pending
 
 
 class UsageError(Exception):
@@ -274,8 +274,9 @@ def launched_transfer(engine, adapter, project, existing):
                 engine.store.db.execute("DELETE FROM metadata WHERE key=?", (key,))
                 engine.store.db.commit()
             return transfer["id"]
-    if has_turns(existing):
-        return None  # an existing session is not the one just launched
+    if has_turns(existing) or existing is not None and any(e.kind == "user" for e in existing.events):
+        # A session whose first recorded prompt is not the launch prompt is not the one launched.
+        return None
     row = engine.store.db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
     if not row:
         return None
@@ -310,7 +311,14 @@ def hook(engine, args, target=None):
     if hook_skips(args, payload):
         return {}
     # The recorded session is parsed once, for both the launch check and the injection check.
-    existing = existing_session(adapter, sid, transcript) if may_inject(engine.config, adapter, args, payload) else None
+    existing, unreadable = None, False
+    if may_inject(engine.config, adapter, args, payload):
+        try:
+            existing = existing_session(adapter, sid, transcript)
+        except (SyncError, OSError, ValueError) as exc:
+            # The launch record can still identify a just-launched session; nothing is injected.
+            unreadable = True
+            print("agent-session-sync hook: {}".format(exc), file=sys.stderr)
     launch = launched_transfer(engine, adapter, project, existing) if may_inject(engine.config, adapter, args, payload) else None
     if launch:
         # An explicit open / handoff --launch already carries its context: inject nothing more,
@@ -320,7 +328,7 @@ def hook(engine, args, target=None):
             engine.store.db.commit()
         request_sync(engine, args, project, adapter, sid)
         return {}
-    if not injects(engine.config, adapter, args, payload, existing):
+    if unreadable or not injects(engine.config, adapter, args, payload, existing):
         # Native mirrors are available in their normal resume picker.
         request_sync(engine, args, project, adapter, sid)
         return {}
@@ -594,7 +602,7 @@ def hand_on_pending(args, directory):
     if depth >= HAND_ON_DEPTH:
         return
     try:
-        if has_pending(directory):
+        if has_takeable(directory):
             spawn_sync(args, directory, {}, depth + 1)
     except (OSError, ValueError, subprocess.SubprocessError):
         pass

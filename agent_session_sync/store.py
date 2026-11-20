@@ -178,6 +178,20 @@ def has_pending(directory):
     return bool(_pending_files(directory))
 
 
+def has_takeable(directory):
+    """Whether some queued request can be opened: worth starting a sync for. An entry that
+    cannot be opened here (a directory, another user's file) is set aside for this process."""
+    for path in _pending_files(directory):
+        try:
+            with path.open("rb"):
+                return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            _stuck.add(str(path))
+    return False
+
+
 class Store:
     def __init__(self, directory, dry_run=False):
         self.directory = Path(directory)
@@ -327,6 +341,30 @@ class Store:
             except ValueError:
                 pass
         return None
+
+    def compressed_twin(self, key, path, stat):
+        """The cached parse of the plain rollout Codex compressed into path (same mtime, same
+        parser inputs), moved to path; None when there is none."""
+        row = self.db.execute("SELECT source_path, stat, document FROM sessions WHERE key=?", (key,)).fetchone()
+        if not row or row[0] != plain_path(path):
+            return None
+        try:
+            old = json.loads(row[1])
+        except (TypeError, ValueError):
+            return None
+        if not (isinstance(old, list) and len(old) == 4 and old[0] == stat[0] and old[2] == stat[2] and old[3] == stat[3]):
+            return None
+        try:
+            value = load_document(row[2])
+        except ValueError:
+            return None
+        if not isinstance(value, dict):
+            return None
+        value = dict(value, source_path=path)
+        self.db.execute("UPDATE sessions SET source_path=?, stat=?, document=? WHERE key=?",
+                        (path, json.dumps(stat), encode_document(json.dumps(value)), key))
+        self.db.commit()
+        return value
 
     def workspace_hint(self, key, path, stat):
         row = self.db.execute("SELECT workspace FROM session_workspaces WHERE key=? AND source_path=? AND stat=?",

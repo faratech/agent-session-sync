@@ -38,6 +38,15 @@ def hot(stat, now=None):
     return bool(stat) and stat.st_size >= HOT_BYTES and (time.time() if now is None else now) - stat.st_mtime < HOT_SECONDS
 
 
+def compressed_from(previous, path, stamp):
+    """A stored parse of the plain rollout Codex has since compressed into path (same mtime)."""
+    if not previous or not stamp or not path.endswith(".jsonl.zst"):
+        return False
+    source, old, _ = previous
+    return (source == path[:-4] and isinstance(old, list) and len(old) == 4
+            and old[0] == stamp[0] and old[2] == stamp[2] and old[3] == stamp[3])
+
+
 def grown_since(previous, path, stamp):
     """True when a stored parse stamp describes an earlier, shorter state of the same append-only file
     whose parser and cache inputs are unchanged, so the workspace parsed then still applies."""
@@ -243,9 +252,14 @@ class Engine:
                         previous = self.store.last_workspace(key)
                         if grown_since(previous, absolute, stamp) and keeps_workspace(adapter, absolute, previous[1][1]):
                             known = previous[2]
+                        elif compressed_from(previous, absolute, stamp):
+                            known = previous[2]
                     if project_key and known and normalize(known) != project_key:
                         continue
                     cached = self.store.cached(key, str(path.absolute()), stamp) if st and not force else None
+                    if cached is None and st and not force and absolute.endswith(".jsonl.zst"):
+                        # Codex compressed the rollout this tool had parsed (it keeps the mtime): same content.
+                        cached = self.store.compressed_twin(key, absolute, stamp)
                     try:
                         session = Session.from_dict(cached) if cached else adapter.read(ref)
                     except SyncError:
@@ -258,7 +272,7 @@ class Engine:
                         session.workspace = session.workspace or self.store.workspace(endpoint, ref.native_id)
                     if session.workspace:
                         session.issues = [issue for issue in session.issues if issue != WORKSPACE_UNKNOWN]
-                    if not cached and hot(st):
+                    if not cached and hot(st) and session.events:
                         # Stale within seconds: keep only the workspace hint, not the full document.
                         self.store.remember_workspace(session, stamp)
                         self.store.db.commit()
@@ -677,6 +691,24 @@ class Engine:
     def handoff(self, session, destination, **kwargs):
         return self.apply(*self.plan(session, destination, **kwargs))
 
+    def archived_earlier(self, source_key, destination, revision):
+        """An import of this revision on this route, made by an earlier renderer, that the user
+        archived in Codex: a re-render (an upgrade) must not bring it back as active."""
+        for (document,) in self.store.db.execute("SELECT document FROM transfers WHERE source_key=? AND destination=?",
+                                                 (source_key, destination)):
+            try:
+                item = json.loads(document)
+                target = Path(item["target"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if item.get("source_revision") != revision or target.exists() or Path(str(target) + ".zst").exists():
+                continue
+            if len(target.parts) >= 5 and target.parts[-5] == "sessions":
+                archived = target.parents[4] / "archived_sessions" / target.name
+                if archived.is_file() or Path(str(archived) + ".zst").is_file():
+                    return True
+        return False
+
     def throttled(self, key, stat, interval):
         """For a large source still being written that sync handled within the interval,
         the record of that pass: [handled at, workspace, conversation updated]; else None.
@@ -794,6 +826,8 @@ class Engine:
                     transfer_id = self.transfer_id(session, target.endpoint, target.native_import, budget, revision=revision)
                     if self.complete(self.store.transfer(transfer_id)):
                         continue
+                    if target.native_import and self.archived_earlier(session.key, target.endpoint, revision):
+                        continue
                     item, files = self.plan(session, target.endpoint, budget=budget, _revision=revision, _serialization=serialization)
                     results.append(self.apply(item, files))
                 except (OSError, SyncError, ValueError) as exc:
@@ -823,4 +857,8 @@ class Engine:
         stored = self.store.transfer(self.transfer_id(session, destination, False, DEFAULT_BUDGET, revision=revision))
         if self.complete(stored):
             return stored  # this exact handoff exists; a new session need not render it again
+        floor = min_free_bytes(self.config)
+        if floor and not self.dry_run and free_bytes(self.directory) < floor:
+            self.errors.append("low disk space: under {:.1f} GB free at {}; skipped the injection".format(floor / 1e9, self.directory))
+            return None
         return self.handoff(session, destination, mode="context", _revision=revision)

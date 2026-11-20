@@ -363,8 +363,23 @@ def prune(store, directory, retention_days=DEFAULT_RETENTION_DAYS, dry_run=False
         if bucket not in newest_in_bucket or written > newest_in_bucket[bucket][0]:
             newest_in_bucket[bucket] = (written, t)
     recent.update(t for _, t in newest_in_bucket.values())
-    # A handoff the user asked for (and its note) stays for the whole retention window.
-    recent.update(t for t, item in transfers.items() if item.get("explicit") or item.get("note")
+    # A handoff the user asked for (and its note), and an earlier rendering of a route's newest
+    # revision, stay for the whole retention window (prune's native_copies reads their manifest).
+    newest_revision = {}
+    for source_key, destination, document in store.db.execute(
+            "SELECT source_key, destination, document FROM transfers WHERE rowid IN "
+            "(SELECT MAX(rowid) FROM transfers GROUP BY source_key, destination)"):
+        try:
+            item = json.loads(document)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            newest_revision[(source_key, destination)] = (item.get("source_revision"), item.get("renderer_version"))
+
+    def rendered_earlier(t, item):
+        top = newest_revision.get(routes.get(t))
+        return bool(top) and item.get("source_revision") == top[0] and item.get("renderer_version") != top[1]
+    recent.update(t for t, item in transfers.items() if item.get("explicit") or item.get("note") or rendered_earlier(t, item)
                   if (_mtime(directory / "handoffs" / t / "manifest.json") or 0) >= cutoff)
     pinned = {os.path.normpath(transfers[t]["archive"]) for t in keep | recent
               if t in transfers and transfers[t].get("archive")}
