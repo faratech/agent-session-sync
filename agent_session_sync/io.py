@@ -264,13 +264,21 @@ def read_records(path):
 
 
 def find_program(name):
-    """shutil.which over the absolute PATH entries only: on Windows, which also searches the
-    current directory first, where an untrusted checkout could plant the program."""
+    """A program on the absolute PATH entries, never in the current directory: on Windows,
+    shutil.which searches the current directory first, where an untrusted checkout could
+    plant the program. PATHEXT is applied explicitly (Python 3.8's which ignores it for
+    a name with a directory), and symlinked directories are compared resolved."""
+    cwd = os.path.normcase(os.path.realpath(os.getcwd()))
+    extensions = [""]
+    if os.name == "nt":
+        extensions += [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
     for entry in os.environ.get("PATH", "").split(os.pathsep):
-        if entry and os.path.isabs(entry) and os.path.normcase(os.path.abspath(entry)) != os.path.normcase(os.getcwd()):
-            found = shutil.which(os.path.join(entry, name))
-            if found:
-                return found
+        if not entry or not os.path.isabs(entry) or os.path.normcase(os.path.realpath(entry)) == cwd:
+            continue
+        for extension in extensions:
+            candidate = os.path.join(entry, name + extension)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
     return None
 
 

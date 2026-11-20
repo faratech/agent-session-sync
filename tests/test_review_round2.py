@@ -32,12 +32,16 @@ MARKED = re.compile(re.escape(MARKER) + r"([a-f0-9-]{36})\]")
 
 
 def zstd_compress(data):
+    from agent_session_sync.io import zstd_available
+    if not zstd_available():
+        raise unittest.SkipTest("no zstd decoder (Python 3.14, zstandard, or the zstd command)")
     try:
         from compression import zstd
         return zstd.compress(data)
     except ImportError:
         pass
-    command = shutil.which("zstd")
+    from agent_session_sync.io import find_program
+    command = find_program("zstd")
     if command is None:
         raise unittest.SkipTest("no zstd compressor (Python 3.14 or the zstd command)")
     return subprocess.run([command, "-q", "-c"], input=data, capture_output=True, check=True).stdout
@@ -393,12 +397,13 @@ class CompressedCodexRollouts(Workspace):
     def test_decompression_falls_back_to_the_zstd_command(self):
         data = b'{"type": "session_meta"}\n'
         packed = zstd_compress(data)
-        if shutil.which("zstd") is None:
+        from agent_session_sync.io import find_program
+        if find_program("zstd") is None:
             self.skipTest("no zstd command")
         with mock.patch.dict(sys.modules, {"compression": None, "compression.zstd": None, "zstandard": None}):
             self.assertEqual(zstd_decompress("x.zst", packed), data)
         with mock.patch.dict(sys.modules, {"compression": None, "compression.zstd": None, "zstandard": None}), \
-                mock.patch("shutil.which", return_value=None), self.assertRaisesRegex(SyncError, "needs Python 3.14"):
+                mock.patch("agent_session_sync.io.find_program", return_value=None), self.assertRaisesRegex(SyncError, "needs Python 3.14"):
             zstd_decompress("x.zst", packed)
 
 
