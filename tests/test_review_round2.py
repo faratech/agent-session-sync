@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from argparse import Namespace
@@ -44,7 +45,14 @@ def zstd_compress(data):
     command = find_program("zstd")
     if command is None:
         raise unittest.SkipTest("no zstd compressor (Python 3.14 or the zstd command)")
-    return subprocess.run([command, "-q", "-c"], input=data, capture_output=True, check=True).stdout
+    # From a file, not stdin: like Codex's rollouts, the frame then declares its content size.
+    handle, name = tempfile.mkstemp(suffix=".jsonl")
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
+        return subprocess.run([command, "-q", "-c", name], capture_output=True, check=True).stdout
+    finally:
+        os.unlink(name)
 
 
 def compress(path):
