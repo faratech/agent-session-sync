@@ -236,37 +236,46 @@ def may_inject(config, adapter, args, payload):
             and config.get("auto_handoff", True) and adapter.options.get("auto_handoff", True))
 
 
-def injects(config, adapter, args, payload, sid, transcript):
-    """may_inject, for a session that has no turns of its own yet."""
-    if not may_inject(config, adapter, args, payload):
-        return False
+def existing_session(adapter, sid, transcript):
+    """The session a start hook reports, as its harness has recorded it so far (or None)."""
     if sid and transcript and Path(transcript).is_file():
-        existing = adapter.read(SessionRef(sid, transcript))
-        if any(e.kind in ("assistant", "tool_call", "tool_result") for e in existing.events) or sum(e.kind == "user" for e in existing.events) > 1:
-            return False
-    return True
+        return adapter.read(SessionRef(sid, transcript))
+    return None
+
+
+def has_turns(session):
+    """The session already has turns of its own (a reply, a tool step, or a second prompt)."""
+    return session is not None and (any(e.kind in ("assistant", "tool_call", "tool_result") for e in session.events)
+                                    or sum(e.kind == "user" for e in session.events) > 1)
+
+
+def injects(config, adapter, args, payload, existing):
+    """may_inject, for a session that has no turns of its own yet."""
+    return may_inject(config, adapter, args, payload) and not has_turns(existing)
 
 
 LAUNCH_SECONDS = 120
 
 
-def launched_transfer(engine, adapter, args, project, sid, transcript):
+def launched_transfer(engine, adapter, project, existing):
     """The transfer an explicit open / handoff --launch started this session with, if any.
 
-    Recognized from the launch prompt when the harness has already recorded it, else from the
-    launch record `execute` leaves for the destination just before starting the harness
-    (consumed here, valid for LAUNCH_SECONDS, for the launch's workspace only).
+    Recognized from the launch prompt when the harness has already recorded it (clearing the
+    launch record), else from the launch record `execute` leaves for the destination just
+    before starting the harness: consumed only by a session with no turns of its own, within
+    LAUNCH_SECONDS, in the launch's workspace.
     """
-    if sid and transcript and Path(transcript).is_file():
-        try:
-            session = adapter.read(SessionRef(sid, transcript))
-        except (SyncError, OSError, ValueError):
-            session = None
-        if session is not None and session.provenance.get("context"):
-            transfer = engine.store.transfer(session.provenance.get("transfer_id", ""))
-            if Engine.launched(session, transfer):
-                return transfer["id"]
     key = "launching:" + adapter.endpoint
+    if existing is not None and existing.provenance.get("context"):
+        transfer = engine.store.transfer(existing.provenance.get("transfer_id", ""))
+        if Engine.launched(existing, transfer):
+            row = engine.store.db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+            if row and transfer["id"] in row[0]:
+                engine.store.db.execute("DELETE FROM metadata WHERE key=?", (key,))
+                engine.store.db.commit()
+            return transfer["id"]
+    if has_turns(existing):
+        return None  # an existing session is not the one just launched
     row = engine.store.db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
     if not row:
         return None
@@ -300,7 +309,9 @@ def hook(engine, args, target=None):
     project = hook_project(engine, adapter, sid, workspace, args.event)[0] if sid else workspace
     if hook_skips(args, payload):
         return {}
-    launch = launched_transfer(engine, adapter, args, project, sid, transcript) if may_inject(engine.config, adapter, args, payload) else None
+    # The recorded session is parsed once, for both the launch check and the injection check.
+    existing = existing_session(adapter, sid, transcript) if may_inject(engine.config, adapter, args, payload) else None
+    launch = launched_transfer(engine, adapter, project, existing) if may_inject(engine.config, adapter, args, payload) else None
     if launch:
         # An explicit open / handoff --launch already carries its context: inject nothing more,
         # and bind the session to the launched transfer.
@@ -309,7 +320,7 @@ def hook(engine, args, target=None):
             engine.store.db.commit()
         request_sync(engine, args, project, adapter, sid)
         return {}
-    if not injects(engine.config, adapter, args, payload, sid, transcript):
+    if not injects(engine.config, adapter, args, payload, existing):
         # Native mirrors are available in their normal resume picker.
         request_sync(engine, args, project, adapter, sid)
         return {}
@@ -334,7 +345,7 @@ def codex_delete(adapters):
     file prune checked is the only rollout of that id (none resumed elsewhere or archived)
     and Codex's index shows no turn or archive beyond the import's own.
     """
-    def delete(destination, native_id, path, check=False):
+    def delete(destination, native_id, path, check=False, gone=()):
         adapter = adapters.get(destination)
         if adapter is None or adapter.installation.harness != "codex" or not adapter.installation.executable:
             return False
@@ -345,6 +356,8 @@ def codex_delete(adapters):
             # Compressed (.jsonl.zst) copies are the same thread: Codex compresses cold rollouts.
             copies = {p.resolve() for p in (home / "sessions").glob("**/rollout-*" + native_id + ".jsonl*")}
             copies |= {p.resolve() for p in (home / "archived_sessions").glob("**/*" + native_id + ".jsonl*")}
+            # A dry run sees the plain twins its prune would remove first as removed.
+            copies -= {Path(p).resolve() for p in gone}
         except (OSError, ValueError, RuntimeError):
             return False
         # Exactly one copy: a plain file beside its .zst twin may differ from it (a continuation).
@@ -366,7 +379,8 @@ def codex_delete(adapters):
 def codex_thread_used(home, native_id, target):
     """Whether Codex shows the thread was used beyond the import: renamed (session_index.jsonl
     or a name), archived, pinned, filed into a section or project, pointing at another rollout,
-    or holding more than the import's single turn.
+    holding more than the import's single turn, or with queued messages, goals, attachments or
+    spawned threads of its own.
 
     Anything missing or unreadable counts as used, so an unknown layout never allows a delete.
     """
@@ -400,6 +414,23 @@ def codex_thread_used(home, native_id, target):
                 turns = db.execute("SELECT count(*) FROM thread_turns WHERE thread_id=?", (native_id,)).fetchone()[0]
             if turns > 1:
                 return True
+        # State only Codex keeps for a thread, which `codex delete` would remove with it.
+        # State only Codex keeps for a thread, which `codex delete` would remove with it. A table a
+        # Codex version does not have holds none of it; any other error still counts as used.
+        for pattern, table, query in (
+                ("queue_*.sqlite", "queued_items", "SELECT 1 FROM queued_items WHERE thread_id=? LIMIT 1"),
+                ("goals_*.sqlite", "thread_goals", "SELECT 1 FROM thread_goals WHERE thread_id=? LIMIT 1"),
+                ("state_*.sqlite", "thread_attachments", "SELECT 1 FROM thread_attachments WHERE thread_id=? LIMIT 1"),
+                ("state_*.sqlite", "thread_spawn_edges",
+                 "SELECT 1 FROM thread_spawn_edges WHERE parent_thread_id=?1 OR child_thread_id=?1 LIMIT 1")):
+            database = newest(pattern)
+            if database is None:
+                continue
+            with contextlib.closing(sqlite3.connect(database.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+                if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                    continue
+                if db.execute(query, (native_id,)).fetchone():
+                    return True
     except (sqlite3.Error, OSError, ValueError):
         return True
     return False
@@ -448,6 +479,7 @@ def execute(args):
     if args.command == "hook":
         return run_hook(args, adapters, config, directory)
     queued = args.command == "sync" and args.queued and not args.dry_run
+    args.engine_ready = False
     try:
         status, pending_launch = run_locked(args, adapters, config, directory, QUEUED_LOCK_WAIT if queued else 0)
     except Busy:
@@ -459,8 +491,11 @@ def execute(args):
             add_pending(directory, {"project": args.project, "hook": args.for_hook})
         return drain_after_release(args, adapters, config, directory)
     except Exception:
-        # This process held the lock and failed: requests queued meanwhile go to a detached sync.
-        if not args.dry_run:
+        # This process held the lock and failed after its engine was ready: requests queued
+        # meanwhile go to a detached sync, which can take them. A failure to open the index (or a
+        # drain-only sync's own failure) is not handed on: a successor would fail the same way.
+        drain_only = queued and not args.project and not args.for_hook
+        if not args.dry_run and args.engine_ready and not drain_only:
             hand_on_pending(args, directory)
         raise
     if not args.dry_run:
@@ -504,13 +539,14 @@ def run_hook(args, adapters, config, directory):
         return 0
     adapter, workspace, sid, transcript = target
     injecting = may_inject(config, adapter, args, args.payload)
-    output, request, held = {}, None, False
+    output, request, ready = {}, None, False
     fallback = None if hook_skips(args, args.payload) else {"project": workspace, "hook": [adapter.endpoint, sid, args.event]}
     try:
         with single_flight(directory, wait=INJECTION_LOCK_WAIT if injecting else HOOK_LOCK_WAIT):
-            held, engine = True, None
+            engine = None
             try:
                 engine = Engine(adapters, directory, False, config)
+                ready = True
                 output = hook(engine, args, target)
                 request = engine.deferred
             except Exception as exc:
@@ -535,24 +571,40 @@ def run_hook(args, adapters, config, directory):
                 add_pending(directory, request)
             except OSError:
                 pass
-    elif held:
+    elif ready:
         hand_on_pending(args, directory)
     return 0
 
 
+# A drain-only sync started by another one is a generation; past this many the queue waits
+# for the next hook or scheduled sync, so no failure can start an endless chain of processes.
+HAND_ON_DEPTH = 3
+
+
+def hand_on_depth():
+    try:
+        return max(0, int(os.environ.get("AGENT_SESSION_SYNC_HAND_ON") or 0))
+    except ValueError:
+        return HAND_ON_DEPTH
+
+
 def hand_on_pending(args, directory):
     """After holding the lock without syncing, hand queued requests to a drain-only sync."""
+    depth = hand_on_depth()
+    if depth >= HAND_ON_DEPTH:
+        return
     try:
         if has_pending(directory):
-            spawn_sync(args, directory, {})
+            spawn_sync(args, directory, {}, depth + 1)
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
 
 
-def spawn_sync(args, directory, request):
+def spawn_sync(args, directory, request, depth=0):
     """Start `sync` for a hook's request in a detached process that outlives the hook.
 
-    An empty request only takes the queued requests (see run_locked).
+    An empty request only takes the queued requests (see run_locked); depth counts the
+    drain-only generations that led to it (see HAND_ON_DEPTH).
     """
     command = entry_command() + ["--state-dir", str(directory)]
     config = args.config or os.environ.get("AGENT_SESSION_SYNC_CONFIG")
@@ -565,7 +617,7 @@ def spawn_sync(args, directory, request):
         command += ["--for-hook"] + list(request["hook"])
     # The hook runs in the user's project; `python -m` would import a same-named package from it.
     options = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True,
-               "cwd": str(directory)}
+               "cwd": str(directory), "env": dict(os.environ, AGENT_SESSION_SYNC_HAND_ON=str(depth))}
     if os.name == "nt":
         # A hidden console of its own, which console programs the sync starts inherit.
         options["creationflags"] = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
@@ -601,8 +653,8 @@ def resolve_request(engine, request):
 
 
 def drain_pending(engine, directory, args):
-    """Run the sync requests queued while this process held the lock."""
-    results = []
+    """Run the sync requests queued while this process held the lock: (results, requests taken)."""
+    results, taken = [], 0
     for _ in range(3):
         try:
             requests = take_pending(directory)
@@ -611,6 +663,7 @@ def drain_pending(engine, directory, args):
             break
         if not requests:
             break
+        taken += len(requests)
         for request in requests:
             try:
                 project, fresh = resolve_request(engine, request)
@@ -620,7 +673,7 @@ def drain_pending(engine, directory, args):
                 results += engine.sync(project=project, fresh=fresh)
             except (OSError, SyncError, ValueError, sqlite3.Error) as exc:
                 engine.errors.append("queued sync {}: {}".format(request.get("project"), exc))
-    return results
+    return results, taken
 
 
 def drain_after_release(args, adapters, config, directory):
@@ -633,7 +686,7 @@ def drain_after_release(args, adapters, config, directory):
             with single_flight(directory):
                 engine = Engine(adapters, directory, False, config)
                 try:
-                    drain_pending(engine, directory, args)
+                    taken = drain_pending(engine, directory, args)[1]
                     for error in engine.errors:
                         print("agent-session-sync: " + error, file=sys.stderr)
                     status = max(status, 1 if engine.errors else 0)
@@ -641,8 +694,10 @@ def drain_after_release(args, adapters, config, directory):
                     engine.close()
         except Busy:
             break  # the new holder takes them
+        if not taken:
+            break  # what is left cannot be taken (unreadable): a successor would not do better
     else:
-        hand_on_pending(args, directory)  # still more after three rounds: a detached sync continues
+        hand_on_pending(args, directory)  # still arriving after three productive rounds: continue detached
     return status
 
 
@@ -650,6 +705,7 @@ def run_locked(args, adapters, config, directory, wait=0):
     pending_launch = None
     with single_flight(directory, args.dry_run, wait):
         engine = Engine(adapters, directory, args.dry_run, config)
+        args.engine_ready = True
         try:
             if args.command == "list":
                 sessions = engine.scan(args.project, args.harness, args.days)
@@ -734,7 +790,7 @@ def run_locked(args, adapters, config, directory, wait=0):
                     drain_only = args.queued and not args.project and not args.for_hook
                     results = [] if drain_only else engine.sync(source, destination, project, args.days, args.budget, fresh=fresh)
                     if not args.dry_run:
-                        results += drain_pending(engine, directory, args)
+                        results += drain_pending(engine, directory, args)[0]
                 emit({"transfers": results, "errors": engine.errors, "dry_run": args.dry_run} if args.json else
                      "{}{} handoff(s) across detected harnesses{}".format("Would prepare " if args.dry_run else "Prepared ", len(results), " ({} errors)".format(len(engine.errors)) if engine.errors else ""), args)
                 if args.verbose and not args.json:

@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .adapters import PARSER_VERSION, SessionRef, WORKSPACE_UNKNOWN, choose_title
 from .blobs import Blob, archive_bytes, blob_dir, internalize, read_archive, write_blob
-from .io import SyncError, atomic_write, digest, json_bytes, loads, normalized_workspace, resolved_workspace, SharedArtifact, atomic_share
+from .io import SyncError, atomic_write, digest, json_bytes, loads, normalized_workspace, resolved_workspace, SharedArtifact, atomic_share, zstd_available
 from .model import Session, Event, identity, markdown, instant
 from .render import DEFAULT_BUDGET, RENDER_VERSION, compact, jsonl_bytes, native_plan
 from .store import Store
@@ -290,7 +290,8 @@ class Engine:
         try:
             oldest = EPOCH + timedelta(seconds=since) if days is not None else None
         except (OverflowError, ValueError):
-            oldest = None
+            # Past year 9999 nothing is new enough (as for native files); before year 1, everything is.
+            oldest = datetime.max.replace(tzinfo=timezone.utc) if since > 0 else None
         for session in imports:
             try:
                 if oldest is not None and instant(session.updated) < oldest:
@@ -313,7 +314,7 @@ class Engine:
         it holds anything the user continued before Codex compressed it.
         """
         compressed = ref.path + ".zst"
-        if not ref.path.endswith(".jsonl") or not os.path.isfile(compressed):
+        if not ref.path.endswith(".jsonl") or not os.path.isfile(compressed) or not zstd_available():
             return ref
         if self.written is None:
             self.written = {}

@@ -56,6 +56,8 @@ complete. If another sync holds the lock for more than ten seconds, it injects
 nothing: only the index can say whether an injection is still due. Every other
 sync runs in a detached `sync` process. When a sync is already running, the request is queued as a file in
 `pending/`, and the process holding the lock takes it before releasing the lock.
+Queued requests are handed on only when a successor can make progress. A failure
+to open the index never starts a chain of processes.
 Each hook syncs the workspace recorded for its own session, even after the agent
 has `cd`'d into a subdirectory. Because those detached syncs also prune, retention
 works on machines without a scheduler.
@@ -340,8 +342,9 @@ of these hold:
 
 A handoff you ask for yourself (`handoff`, `open`, `sync --session`) is kept until
 it leaves the retention window, along with its note. Handoffs made before 2.2.0
-carry no such mark. Any import of the same revision as the newest one also stays,
-including one an earlier release rendered.
+carry no such mark. An import of the newest revision made by an earlier release
+also stays through the retention window. An import of the newest revision with a
+different note or budget stays as long as that revision is the newest.
 
 Claude copies are deleted. Codex copies are removed with `codex delete --force`,
 which also drops them from Codex's own thread index. Because that command acts on
@@ -349,7 +352,8 @@ the whole thread, it runs only in these conditions:
 
 - the copy is the only rollout of its id, with none resumed elsewhere or archived;
 - Codex's index shows nothing beyond the import's own turn, and the thread was not
-  renamed, pinned, archived or filed into a section or project;
+  renamed, pinned, archived or filed into a section or project, and holds no queued
+  messages, goals, attachments or spawned threads;
 - the Codex executable is available.
 
 With no Codex index to check, nothing is deleted.

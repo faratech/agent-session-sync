@@ -196,8 +196,11 @@ class PendingQueueFiles(Workspace):
         with mock.patch.object(Path, "read_bytes", read_bytes):
             self.assertEqual(take_pending(self.state), [{"project": "/a", "hook": None}])
         self.assertTrue(blocked.exists())
-        self.assertEqual(take_pending(self.state), [{"project": "/b", "hook": None}])
+        # Set aside for the rest of this process (no drain loops on it); a new process retries it.
+        self.assertEqual(take_pending(self.state), [])
         self.assertFalse(has_pending(self.state))
+        with mock.patch("agent_session_sync.store._stuck", set()):
+            self.assertEqual(take_pending(self.state), [{"project": "/b", "hook": None}])
 
 
 class GrownTranscriptsThatChangeWorkspace(Workspace):

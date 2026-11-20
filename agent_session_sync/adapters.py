@@ -12,7 +12,7 @@ from .model import Event, Session, MARKER, identity, timestamp
 
 WORKSPACE_UNKNOWN = "workspace unknown; supply workspace_map or capture a hook notification"
 # Bump when a built-in parser's output changes so cached parses are refreshed.
-PARSER_VERSION = 3
+PARSER_VERSION = 4
 
 
 @dataclass

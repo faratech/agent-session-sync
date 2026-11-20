@@ -246,7 +246,8 @@ def read_records(path):
             found = salvage(line, bad, issues, index + 1)
             if found is None:
                 # Power loss can also leave NUL padding where the rest of the record should be.
-                cut_short = exc.msg.startswith("Unterminated string") or exc.pos >= len(line.rstrip(" \t\r\x00"))
+                cut_short = exc.msg.startswith("Unterminated string") or exc.pos >= len(line.rstrip(" \t\r\x00")) \
+                    or cut_in_token(line, exc.pos)
                 if not cut_short or truncated is not None:
                     raise SyncError("invalid JSON at {}:{}: {}".format(path, index + 1, exc))
                 # A crash can cut a record short; it is skipped only once the writer is seen to continue.
@@ -268,12 +269,15 @@ def find_program(name):
     shutil.which searches the current directory first, where an untrusted checkout could
     plant the program. PATHEXT is applied explicitly (Python 3.8's which ignores it for
     a name with a directory), and symlinked directories are compared resolved."""
-    cwd = os.path.normcase(os.path.realpath(os.getcwd()))
+    try:
+        cwd = os.path.normcase(os.path.realpath(os.getcwd()))
+    except OSError:
+        cwd = None  # a removed directory cannot hold a planted program
     extensions = [""]
     if os.name == "nt":
         extensions += [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
     for entry in os.environ.get("PATH", "").split(os.pathsep):
-        if not entry or not os.path.isabs(entry) or os.path.normcase(os.path.realpath(entry)) == cwd:
+        if not entry or not os.path.isabs(entry) or cwd is not None and os.path.normcase(os.path.realpath(entry)) == cwd:
             continue
         for extension in extensions:
             candidate = os.path.join(entry, name + extension)
@@ -324,10 +328,13 @@ def zstd_decompress(path, data):
             while data:
                 stream = zstandard.ZstdDecompressor().decompressobj()
                 parts.append(stream.decompress(data))
+                if getattr(stream, "eof", None) is None:
+                    # An older zstandard cannot tell where a frame ends; read one frame as before.
+                    return parts[0]
                 if not stream.eof:
                     raise SyncError("cannot decompress {}: truncated".format(path))
                 data = stream.unused_data
-        except zstandard.ZstdError as exc:
+        except (zstandard.ZstdError, AttributeError) as exc:
             raise SyncError("cannot decompress {}: {}".format(path, exc))
         return b"".join(parts)
     command = find_program("zstd")
@@ -359,6 +366,19 @@ def appended_matches(path, start, pattern, chunk=1 << 20):
             carry = data[-256:]
 
 
+# What a record cut inside its last token ends with: part of true/false/null, a number, or a
+# \\u escape (the line is also cut short then, not malformed).
+PARTIAL_TOKEN = re.compile(r'(?:t(?:ru?)?|f(?:a(?:ls?)?)?|n(?:ul?)?|-?\d*(?:\.\d*)?(?:[eE][-+]?\d*)?|"(?:[^"\\]|\\.)*\\u[0-9a-fA-F]{0,3})')
+
+
+def cut_in_token(line, position):
+    """Whether a JSON error at position is a record cut inside its final token."""
+    text = line.rstrip(" \t\r\x00")
+    start = max(text.rfind(c, 0, max(position, 1)) for c in ':,[') + 1
+    tail = text[start:].lstrip()
+    return bool(tail) and position >= start and PARTIAL_TOKEN.fullmatch(tail) is not None
+
+
 # Bytes that were not UTF-8, as surrogateescape keeps them; strict decoding never yields these.
 ESCAPED_BYTE = re.compile("[\udc80-\udcff]")
 
@@ -371,6 +391,8 @@ def torn_suffix(line, after=1):
     for match in re.finditer(r'\{\s*"', line):
         if match.start() < after:
             continue
+        if line[:match.start()].rstrip(" \t\r\x00").endswith((":", ",", "[")):
+            continue  # a value inside the cut record, not a record of its own
         try:
             value, stop = decoder.raw_decode(line, match.start())
             if stop == end and isinstance(value, dict):
@@ -388,7 +410,7 @@ def salvage(line, bad, issues, number):
     record cut off by an interleaved writer is kept. A kept record holding bytes that were
     not UTF-8 makes the line invalid (raises bad); this is checked before any scrubbing.
     """
-    kept = []
+    kept, following = [], 1
     try:
         value, stop = json.JSONDecoder().raw_decode(line, 0)
     except (ValueError, RecursionError):
@@ -404,9 +426,12 @@ def salvage(line, bad, issues, number):
                 kept = [(value, 0, stop), (successor[0], following, len(line))]
                 issues.append("two records joined on line {} were split".format(number))
     if not kept:
-        successor = torn_suffix(line)
+        # After a complete leading record, look for a successor only past it.
+        successor = torn_suffix(line, following)
         if successor is None:
             return None
+        if isinstance(value, dict) and stop <= successor[1]:
+            kept.append((value, 0, stop))  # a complete leading record stays
         kept.append((successor[0], successor[1], len(line)))
         # Interleaved writers can leave a cut-off record glued to a complete one.
         issues.append("torn record at line {} dropped; its complete successor was kept".format(number))

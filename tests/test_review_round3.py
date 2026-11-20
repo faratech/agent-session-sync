@@ -150,7 +150,7 @@ class HookFailuresStillHandOn(CliWorkspace):
 
     def test_drain_hands_on_what_is_left_after_its_rounds(self):
         args = Namespace(config=None, budget=None)
-        with mock.patch.object(cli, "has_pending", return_value=True), mock.patch.object(cli, "drain_pending", return_value=[]), \
+        with mock.patch.object(cli, "has_pending", return_value=True), mock.patch.object(cli, "drain_pending", return_value=([], 1)), \
                 mock.patch.object(cli, "hand_on_pending") as hand_on:
             cli.drain_after_release(args, self.adapters, {}, self.state)
         hand_on.assert_called_once()

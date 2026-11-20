@@ -159,6 +159,7 @@ def take_pending(directory):
         except ValueError:
             value = None
         except OSError:
+            _stuck.add(str(path))  # unreadable here (a directory, another user's file): set aside
             continue
         try:
             path.unlink()

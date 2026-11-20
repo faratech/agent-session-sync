@@ -170,17 +170,21 @@ def native_copies(store, settle, harnesses, cutoff=None, gone=()):
         items.append((rowid, route, str(destination).split("@", 1)[0], item))
         # Only a finished import supersedes others: an interrupted newer one may never exist.
         if item.get("state") == "complete" and (route not in newest or rowid > newest[route][0]):
-            newest[route] = (rowid, item.get("source_revision"))
+            newest[route] = (rowid, item.get("source_revision"), item.get("renderer_version"))
 
     def current(rowid, route, item):
-        # The newest finished import of a route, anything after it, every import of the same
-        # source revision (an explicit handoff with a note or budget, or one rendered by an
-        # earlier release, sits beside the automatic one), and a user-requested import until
-        # it leaves the retention window (its handoff folder is kept that long).
+        # The newest finished import of a route, anything after it, and every import of the same
+        # revision and renderer (an explicit handoff with a note or budget sits beside the
+        # automatic one).
         top = newest.get(route)
-        if top is None or rowid >= top[0] or item.get("source_revision") == top[1]:
+        if top is None or rowid >= top[0]:
             return True
-        if item.get("explicit") or item.get("note"):
+        same_revision = item.get("source_revision") == top[1]
+        if same_revision and item.get("renderer_version") == top[2]:
+            return True
+        if same_revision or item.get("explicit") or item.get("note"):
+            # An older rendering of the same revision (an upgrade), or a handoff the user asked
+            # for: kept through the retention window, then one copy per conversation remains.
             written = _mtime(Path(item["context"]).with_name("manifest.json")) if isinstance(item.get("context"), str) else None
             return cutoff is None or (written is not None and written >= cutoff)
         return False
@@ -218,17 +222,21 @@ def native_copies(store, settle, harnesses, cutoff=None, gone=()):
 
 
 def compressed_duplicates(store, settle):
-    """Plain Codex imports written again after Codex had compressed them (yields the plain paths).
+    """Plain Codex imports written again after Codex had compressed or archived them (yields
+    the plain paths).
 
-    The plain file holds exactly what sync wrote (its recorded digest), so it is a copy of
-    a thread Codex already keeps compressed at the same path; the .zst, which holds anything
-    the user continued before Codex compressed it, always stays."""
+    The plain file holds exactly what sync wrote (its recorded digest), so it is a copy of a
+    thread Codex already keeps compressed at the same path, or archived in archived_sessions/;
+    that copy, which holds anything the user continued before, always stays."""
     for (document,) in store.db.execute("SELECT document FROM transfers WHERE destination='codex' OR destination LIKE 'codex@%'"):
         try:
             item = json.loads(document)
             path = Path(item["target"])
-            compressed = Path(str(path) + ".zst")
-            if not (path.is_file() and compressed.is_file()) or path.stat().st_mtime >= settle:
+            twins = [Path(str(path) + ".zst")]
+            if len(path.parts) >= 5 and path.parts[-5] == "sessions":
+                archived = path.parents[4] / "archived_sessions" / path.name
+                twins += [archived, Path(str(archived) + ".zst")]
+            if not path.is_file() or not any(twin.is_file() for twin in twins) or path.stat().st_mtime >= settle:
                 continue
             if file_digest(path) == item["target_sha"]:
                 yield path
@@ -381,7 +389,7 @@ def prune(store, directory, retention_days=DEFAULT_RETENTION_DAYS, dry_run=False
                                                                       cutoff, removed_twins if dry_run else ()):
         if harness == "codex" and delete is None:
             continue
-        if dry_run and harness == "codex" and not delete(destination, native_id, path, check=True):
+        if dry_run and harness == "codex" and not delete(destination, native_id, path, check=True, gone=removed_twins):
             continue
         if not dry_run:
             if harness == "codex":
