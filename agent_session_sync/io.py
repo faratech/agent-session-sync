@@ -43,6 +43,11 @@ def loads(data):
     except RecursionError:
         # Pathologically nested input is malformed data, not an interpreter failure.
         raise json.JSONDecodeError("JSON nesting is too deep", data, 0)
+    except json.JSONDecodeError:
+        raise
+    except ValueError as exc:
+        # json reports an integer literal over the digit limit as a plain ValueError.
+        raise json.JSONDecodeError(str(exc), data, 0)
 
 
 def workspace_path(value, windows=None):
@@ -244,6 +249,8 @@ def read_records(path):
                 issues.append("incomplete trailing record deferred")
                 break
             found = salvage(line, bad, issues, index + 1)
+            if found is None and not isinstance(exc, json.JSONDecodeError):
+                raise SyncError("invalid JSON at {}:{}: {}".format(path, index + 1, exc))
             if found is None:
                 # Power loss can also leave NUL padding where the rest of the record should be.
                 cut_short = exc.msg.startswith("Unterminated string") or exc.pos >= len(line.rstrip(" \t\r\x00")) \
@@ -262,6 +269,28 @@ def read_records(path):
     if truncated is not None:
         raise SyncError("invalid JSON at {}:{}: {}".format(path, truncated[0], truncated[1]))
     return records, issues, digest(raw)
+
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def zstd_content_size(path):
+    """The decompressed size the first frame header of a .zst file declares, or None."""
+    try:
+        with open(str(path), "rb") as handle:
+            head = handle.read(18)
+    except OSError:
+        return None
+    if len(head) < 6 or head[:4] != ZSTD_MAGIC:
+        return None
+    descriptor = head[4]
+    single = (descriptor >> 5) & 1
+    position = 5 + (0 if single else 1) + (0, 1, 2, 4)[descriptor & 3]
+    size = (1 if single else 0, 2, 4, 8)[descriptor >> 6]
+    if not size or len(head) < position + size:
+        return None
+    value = int.from_bytes(head[position:position + size], "little")
+    return value + 256 if size == 2 else value
 
 
 def find_program(name):
@@ -380,9 +409,12 @@ PARTIAL_TOKEN = re.compile(r'(?:t(?:ru?)?|f(?:a(?:ls?)?)?|n(?:ul?)?|-?\d*(?:\.\d
 
 
 def cut_in_escape(line, exc):
-    """Whether a JSON error is a record cut inside a \\uXXXX escape (whatever the string held before)."""
-    return exc.msg.startswith("Invalid \\uXXXX escape") and \
-        re.fullmatch(r"\\?u[0-9a-fA-F]{0,3}", line.rstrip(" \t\r\x00")[exc.pos:]) is not None
+    """Whether a JSON error is a record cut inside an escape (whatever the string held before):
+    in a \\uXXXX escape, or right after its backslash with NUL padding after it."""
+    tail = line.rstrip(" \t\r\x00")[exc.pos:]
+    if exc.msg.startswith("Invalid \\escape"):
+        return tail == "\\"
+    return exc.msg.startswith("Invalid \\uXXXX escape") and re.fullmatch(r"\\?u[0-9a-fA-F]{0,3}", tail) is not None
 
 
 def cut_in_token(line, position):
@@ -403,6 +435,9 @@ def torn_suffix(line, after=1):
     end = len(line.rstrip(" \t\r"))
     decoder = json.JSONDecoder()
     absorbed = None  # whether the cut record parses to the end of the line (computed once, if needed)
+    # Each candidate may parse to the end of the line: past a bound (a deeply nested cut record)
+    # the line is left to the cut-short / invalid-JSON handling instead of quadratic work.
+    examined, bound = 0, 32 * len(line) + 4096
     for match in re.finditer(r'\{\s*"', line):
         if match.start() < after:
             continue
@@ -421,9 +456,12 @@ def torn_suffix(line, after=1):
                 except ValueError as exc:
                     absorbed = getattr(exc, "pos", -1) >= end
                 except RecursionError:
-                    absorbed = False
+                    absorbed = True  # too deep to judge: as before, its nested objects are not records
             if absorbed:
                 continue
+        examined += end - match.start()
+        if examined > bound:
+            return None
         try:
             value, stop = decoder.raw_decode(line, match.start())
             if stop == end and isinstance(value, dict):

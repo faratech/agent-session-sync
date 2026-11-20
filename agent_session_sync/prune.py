@@ -251,22 +251,43 @@ def unchanged(stored, item):
     a later render changed (the Codex version in session_meta): it is unchanged when it parses
     to exactly the import's two baseline events.
     """
-    if not str(stored).endswith(".zst"):
-        return file_digest(stored) == item["target_sha"]
-    content = zstd_decompress(stored, Path(stored).read_bytes())
-    if hashlib.sha256(content).hexdigest() == item["target_sha"]:
-        return True
+    compressed = str(stored).endswith(".zst")
+    if not compressed:
+        if file_digest(stored) == item["target_sha"]:
+            return True
+        if not Path(stored).name.startswith("rollout-"):
+            return False  # a Claude import must hold exactly what sync wrote
+        # Codex rewrites rollouts it migrates to paginated history (dropping this tool's
+        # provenance and adding items) without new turns: compared by parse as a .zst is.
+        content = Path(stored).read_bytes()
+    else:
+        content = zstd_decompress(stored, Path(stored).read_bytes())
+        if hashlib.sha256(content).hexdigest() == item["target_sha"]:
+            return True
     if not item.get("baseline_sha"):
         return False
-    from .adapters import Codex, SessionRef
+    from .adapters import Codex, SessionRef, text
     from .discovery import Installation
     from .engine import event_fingerprint
     try:
         records = [json.loads(line) for line in content.decode("utf-8").split("\n") if line.strip()]
         session = Codex(Installation("codex", "default", str(Path(stored).parent))).parse(records, SessionRef(item["native_id"], str(stored)))
+        if len(session.events) != item.get("baseline_count", 2) or event_fingerprint(session.events) != item["baseline_sha"]:
+            return False
+        # A continuation records a prompt of its own; a migration only re-records the import's.
+        own = {event.text for event in session.events if event.kind == "user"}
+        for record in records:
+            payload = record.get("payload") if isinstance(record, dict) and record.get("type") == "event_msg" else None
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "user_message" and payload.get("message", "") not in own:
+                return False
+            if payload.get("type") == "item_completed" and isinstance(payload.get("item"), dict) \
+                    and payload["item"].get("type") == "UserMessage" and text(payload["item"].get("content")) not in own:
+                return False
     except (ValueError, TypeError, AttributeError, KeyError, SyncError):
         return False
-    return len(session.events) == item.get("baseline_count", 2) and event_fingerprint(session.events) == item["baseline_sha"]
+    return True
 
 
 def content_digest(path):

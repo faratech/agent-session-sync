@@ -234,6 +234,11 @@ An empty route list disables automatic transfers. Explicit handoffs still work.
 `auto_handoff: false` globally or per harness disables startup context injection;
 `enabled: false` per harness excludes it from discovery.
 
+Muse discards a hook answer over 16 KiB, so its injected context is rendered to fit
+(about 12 KB instead of 32 KB). A context that still would not fit is not injected,
+and the session is not linked to it. A per-harness `hook_output_limit` (bytes)
+sets this ceiling for any harness.
+
 Profiles sharing a startup-hook settings file are identified by their transcript
 paths. If a harness omits that path at startup, automatic context injection is
 skipped rather than assuming the default profile. Use separate profile settings
@@ -346,6 +351,11 @@ carry no such mark. An import of the newest revision made by an earlier release
 also stays through the retention window. An import of the newest revision with a
 different note or budget stays as long as that revision is the newest.
 
+A Codex import that Codex later migrated to its paginated history format no longer
+holds the bytes sync wrote. It still counts as unchanged when it parses to exactly the
+imported turn and records no prompt of its own; it also stays recognized as the
+import after its handoff folder is pruned.
+
 Claude copies are deleted. Codex copies are removed with `codex delete --force`,
 which also drops them from Codex's own thread index. Because that command acts on
 the whole thread, it runs only in these conditions:
@@ -368,7 +378,8 @@ Codex compresses cold rollouts into `rollout-*.jsonl.zst`. These are read with
 Python 3.14's `compression.zstd`, the `zstandard` package, or the `zstd` command.
 Without any of these, compressed rollouts are skipped. An import you archive in
 Codex counts as present and is not written back, including after an upgrade that
-renders imports differently. When Codex compresses a rollout this tool has already
+renders imports differently, and including when an earlier release had written it
+back. When Codex compresses a rollout this tool has already
 read, the earlier parse is reused instead of decompressing it again.
 A compressed import counts as present, so it is never written again. Earlier
 releases did write some back beside the compressed copy. Prune removes such a plain

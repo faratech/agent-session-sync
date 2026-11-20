@@ -109,15 +109,22 @@ class LaunchRecordEdges(CliWorkspace):
         finally:
             engine.close()
 
-    def test_an_unreadable_transcript_still_finds_the_launch_record(self):
-        launch = self.launch("copilot")
+    def test_an_unreadable_transcript_leaves_the_launch_record_alone(self):
+        # Round six: a transcript that exists already has content; the launched session is
+        # recognized later by its launch prompt's marker, an unrelated one must not take the record.
+        self.launch("copilot")
         transcript = self.base / "unreadable" / "events.jsonl"
         transcript.parent.mkdir()
         transcript.write_bytes(b'{"type": "session.start"}\n{"bad": "\xff"}\n{"type": "user.message"}\n')
         payload = {"session_id": "launched", "cwd": str(self.project), "source": "startup", "transcript_path": str(transcript)}
         status, output, _ = self.cli("hook", "--harness", "copilot", "--event", "start", "--inline", payload=payload)
         self.assertEqual((status, json.loads(output)), (0, {}))
-        self.assertEqual(self.binding("copilot", "launched"), launch)
+        self.assertIsNone(self.binding("copilot", "launched"))
+        engine = self.engine()
+        try:
+            self.assertIsNotNone(engine.store.db.execute("SELECT 1 FROM metadata WHERE key='launching:copilot'").fetchone())
+        finally:
+            engine.close()
 
     def test_a_session_whose_first_prompt_is_not_the_launch_prompt_leaves_the_record(self):
         self.launch("copilot")

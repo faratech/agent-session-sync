@@ -145,6 +145,9 @@ class Codex(Adapter):
         return not str(path).endswith(".zst")  # the first session_meta names the workspace
 
     def read(self, ref):
+        quick = self.subagent(ref)
+        if quick is not None:
+            return quick
         try:
             return super().read(ref)
         except FileNotFoundError:
@@ -169,6 +172,31 @@ class Codex(Adapter):
             if match and match.group(1) not in plain:
                 yield SessionRef(match.group(1), str(path))
 
+    @staticmethod
+    def is_subagent(meta):
+        return meta.get("thread_source") == "subagent" or isinstance(meta.get("source"), dict) and "subagent" in meta["source"]
+
+    def subagent(self, ref):
+        """A subagent rollout parses to its session_meta alone, so only that first record is
+        read: a large one still being written is otherwise read in full on every sync."""
+        if ref.path.endswith(".zst"):
+            return None
+        try:
+            with open(ref.path, "rb") as handle:
+                line = handle.readline(4 << 20)
+            record = loads(line) if line.endswith(b"\n") else None
+        except (OSError, ValueError, SyncError):
+            return None
+        meta = record.get("payload") if isinstance(record, dict) and record.get("type") == "session_meta" else None
+        if not isinstance(meta, dict) or not self.is_subagent(meta):
+            return None
+        try:
+            session = self.parse([record], ref)
+        except (AttributeError, TypeError, SyncError):
+            return None
+        session.source_path = str(Path(ref.path).absolute())
+        return session
+
     def parse(self, records, ref):
         if not records:
             # A rollout is created before its first record; it holds no session yet.
@@ -184,7 +212,7 @@ class Codex(Adapter):
             session.native_id = meta["id"]
         if (meta.get("base_instructions") or {}).get("text", "").startswith("External import of Claude Code session"):
             session.provenance = {"legacy_import": True}
-        if meta.get("thread_source") == "subagent" or isinstance(meta.get("source"), dict) and "subagent" in meta["source"]:
+        if self.is_subagent(meta):
             return session
         prompts = [r["payload"].get("message", "") for r in records
                    if r.get("type") == "event_msg" and (r.get("payload") or {}).get("type") == "user_message"]

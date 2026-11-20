@@ -3,13 +3,14 @@ import itertools
 import json
 import os
 import sqlite3
+import stat as stat_module
 import tempfile
 import time
 import zlib
 from contextlib import contextmanager
 from pathlib import Path
 
-from .io import SyncError, atomic_write, loads, normalized_workspace
+from .io import SyncError, atomic_write, loads, normalized_workspace, zstd_content_size
 from .model import Session, imported_snapshot
 
 APPLICATION_ID = 0x41535359
@@ -179,16 +180,20 @@ def has_pending(directory):
 
 
 def has_takeable(directory):
-    """Whether some queued request can be opened: worth starting a sync for. An entry that
-    cannot be opened here (a directory, another user's file) is set aside for this process."""
+    """Whether some queued request can be read: worth starting a sync for. An entry that cannot
+    (a directory, another user's file) is set aside for this process. Entries are only stat'ed:
+    an open handle outside the lock would make the holder's unlink fail on Windows."""
     for path in _pending_files(directory):
         try:
-            with path.open("rb"):
-                return True
+            st = path.stat()
         except FileNotFoundError:
             continue
         except OSError:
             _stuck.add(str(path))
+            continue
+        if stat_module.S_ISREG(st.st_mode) and os.access(str(path), os.R_OK):
+            return True
+        _stuck.add(str(path))
     return False
 
 
@@ -353,6 +358,10 @@ class Store:
         except (TypeError, ValueError):
             return None
         if not (isinstance(old, list) and len(old) == 4 and old[0] == stat[0] and old[2] == stat[2] and old[3] == stat[3]):
+            return None
+        # The same mtime can hide an append within one clock tick: the compressed content must
+        # also be exactly as long as the plain file that was parsed.
+        if type(old[1]) is not int or zstd_content_size(path) != old[1]:
             return None
         try:
             value = load_document(row[2])

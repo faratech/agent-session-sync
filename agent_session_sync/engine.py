@@ -411,7 +411,13 @@ class Engine:
             session.provenance = {}
             return session
         baseline_count = provenance.get("baseline_count", 0)
-        if provenance.get("context"):
+        if (provenance.get("context") and transfer.get("mode") == "native" and transfer.get("destination") == session.endpoint
+                and transfer.get("native_id") and transfer.get("native_id") == session.native_id):
+            # A native import whose structural provenance was dropped (Codex migrate-rollouts
+            # rewrites rollouts without it) is still that import: the thread is the one written.
+            # The baseline fingerprint below still checks its imported prefix.
+            baseline_count = transfer.get("baseline_count", 2)
+        elif provenance.get("context"):
             # launched: the first prompt is the launch command of `open` / `handoff --launch`.
             # injected: the first prompt is the prepared context itself.
             launched, injected = self.launched(session, transfer), False
@@ -701,12 +707,21 @@ class Engine:
                 target = Path(item["target"])
             except (ValueError, KeyError, TypeError):
                 continue
-            if item.get("source_revision") != revision or target.exists() or Path(str(target) + ".zst").exists():
+            if item.get("source_revision") != revision or Path(str(target) + ".zst").exists():
                 continue
             if len(target.parts) >= 5 and target.parts[-5] == "sessions":
                 archived = target.parents[4] / "archived_sessions" / target.name
-                if archived.is_file() or Path(str(archived) + ".zst").is_file():
+                if not (archived.is_file() or Path(str(archived) + ".zst").is_file()):
+                    continue
+                if not target.exists():
                     return True
+                # Releases before 2.2.0 wrote an archived import back into sessions/; that
+                # unchanged copy does not make the conversation active again.
+                try:
+                    if target.is_file() and item.get("target_sha") and file_sha(target) == item["target_sha"]:
+                        return True
+                except OSError:
+                    pass
         return False
 
     def throttled(self, key, stat, interval):
@@ -824,7 +839,13 @@ class Engine:
                         continue
                 try:
                     transfer_id = self.transfer_id(session, target.endpoint, target.native_import, budget, revision=revision)
-                    if self.complete(self.store.transfer(transfer_id)):
+                    stored = self.store.transfer(transfer_id)
+                    if self.complete(stored):
+                        top = self.store.previous(session.key, target.endpoint)
+                        if not self.dry_run and top and top.get("source_revision") != revision:
+                            # The source returned to this revision: its transfer is the route's
+                            # newest again (prune keeps the newest, so it must not lose that place).
+                            self.store.save_transfer(stored)
                         continue
                     if target.native_import and self.archived_earlier(session.key, target.endpoint, revision):
                         continue
@@ -838,7 +859,7 @@ class Engine:
                 self.considered(session, hot_stat)
         return results
 
-    def incoming(self, destination, project, exclude_session=None):
+    def incoming(self, destination, project, exclude_session=None, budget=DEFAULT_BUDGET):
         max_age = injection_max_age(self.config)
         # Only a recently active conversation is injected, so only that window is scanned.
         days = 30 if max_age is None else max_age / 86400
@@ -854,11 +875,11 @@ class Engine:
             return None
         session = candidates[0]
         revision = self.revision_of(session)
-        stored = self.store.transfer(self.transfer_id(session, destination, False, DEFAULT_BUDGET, revision=revision))
+        stored = self.store.transfer(self.transfer_id(session, destination, False, budget, revision=revision))
         if self.complete(stored):
             return stored  # this exact handoff exists; a new session need not render it again
         floor = min_free_bytes(self.config)
         if floor and not self.dry_run and free_bytes(self.directory) < floor:
             self.errors.append("low disk space: under {:.1f} GB free at {}; skipped the injection".format(floor / 1e9, self.directory))
             return None
-        return self.handoff(session, destination, mode="context", _revision=revision)
+        return self.handoff(session, destination, mode="context", budget=budget, _revision=revision)

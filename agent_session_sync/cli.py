@@ -292,6 +292,26 @@ def launched_transfer(engine, adapter, project, existing):
     return None
 
 
+# Harnesses that discard a larger hook answer outright (Muse kills the hook past 16 KiB).
+HOOK_OUTPUT_LIMITS = {"muse": 16384}
+
+
+def hook_output_limit(adapter):
+    value = adapter.options.get("hook_output_limit", HOOK_OUTPUT_LIMITS.get(adapter.installation.harness))
+    return value if type(value) is int and value > 0 else None
+
+
+class Uninstalled(Exception):
+    """The installation was purged while this process waited for the lock."""
+
+
+def config_removed(args):
+    """Whether the configuration this process started with was removed while it waited for the
+    lock (uninstall --purge): it must not recreate the state that was purged."""
+    selected = getattr(args, "config", None) or os.environ.get("AGENT_SESSION_SYNC_CONFIG")
+    return bool(selected) and not Path(selected).expanduser().is_file()
+
+
 def injection_output(adapter, context):
     name = adapter.installation.harness
     if name == "agy":
@@ -316,10 +336,13 @@ def hook(engine, args, target=None):
         try:
             existing = existing_session(adapter, sid, transcript)
         except (SyncError, OSError, ValueError) as exc:
-            # The launch record can still identify a just-launched session; nothing is injected.
+            # A session with a transcript already has content: a launched one is recognized later
+            # by the marker of its launch prompt, so the launch record is left alone too.
             unreadable = True
             print("agent-session-sync hook: {}".format(exc), file=sys.stderr)
-    launch = launched_transfer(engine, adapter, project, existing) if may_inject(engine.config, adapter, args, payload) else None
+    launch = None
+    if not unreadable and may_inject(engine.config, adapter, args, payload):
+        launch = launched_transfer(engine, adapter, project, existing)
     if launch:
         # An explicit open / handoff --launch already carries its context: inject nothing more,
         # and bind the session to the launched transfer.
@@ -332,17 +355,27 @@ def hook(engine, args, target=None):
         # Native mirrors are available in their normal resume picker.
         request_sync(engine, args, project, adapter, sid)
         return {}
-    item = engine.incoming(adapter.endpoint, project, sid)
+    limit = hook_output_limit(adapter)
+    # A harness that drops a larger answer gets a context sized to fit (JSON escaping adds some).
+    budget = DEFAULT_BUDGET if limit is None else max(1024, min(DEFAULT_BUDGET, limit * 3 // 4))
+    item = engine.incoming(adapter.endpoint, project, sid, budget=budget)
     if not item:
         request_sync(engine, args, project, adapter, sid)
         return {}
     context = Path(item["context"]).read_text(encoding="utf-8-sig")
+    output = injection_output(adapter, context)
+    if limit is not None and len(json.dumps(output, ensure_ascii=False).encode("utf-8")) + 1 > limit:
+        # The harness would discard it: inject nothing, and bind nothing it never received.
+        print("agent-session-sync hook: the context exceeds {}'s {}-byte hook output; nothing injected".format(
+            adapter.installation.harness, limit), file=sys.stderr)
+        request_sync(engine, args, project, adapter, sid)
+        return {}
     if sid:
         engine.store.db.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)",
                                 ("binding:{}:{}".format(adapter.endpoint, sid), item["id"]))
         engine.store.db.commit()
     request_sync(engine, args, project, adapter, sid)
-    return injection_output(adapter, context)
+    return output
 
 
 def codex_delete(adapters):
@@ -553,10 +586,14 @@ def run_hook(args, adapters, config, directory):
         with single_flight(directory, wait=INJECTION_LOCK_WAIT if injecting else HOOK_LOCK_WAIT):
             engine = None
             try:
+                if config_removed(args):
+                    raise Uninstalled()
                 engine = Engine(adapters, directory, False, config)
                 ready = True
                 output = hook(engine, args, target)
                 request = engine.deferred
+            except Uninstalled:
+                output, request = {}, None  # uninstalled while waiting: nothing to sync or recreate
             except Exception as exc:
                 # Fail open, but the session still gets its sync and the queue is still handed on.
                 print("agent-session-sync hook: {}".format(exc), file=sys.stderr)
@@ -712,6 +749,8 @@ def drain_after_release(args, adapters, config, directory):
 def run_locked(args, adapters, config, directory, wait=0):
     pending_launch = None
     with single_flight(directory, args.dry_run, wait):
+        if config_removed(args):
+            raise SyncError("the configuration was removed while waiting for the sync lock (uninstalled?); nothing done")
         engine = Engine(adapters, directory, args.dry_run, config)
         args.engine_ready = True
         try:
