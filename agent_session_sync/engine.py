@@ -14,7 +14,7 @@ from .adapters import PARSER_VERSION, SessionRef, WORKSPACE_UNKNOWN, choose_titl
 from .blobs import Blob, archive_bytes, blob_dir, internalize, read_archive, write_blob
 from .io import SyncError, atomic_write, digest, json_bytes, loads, normalized_workspace, resolved_workspace, SharedArtifact, atomic_share, zstd_available
 from .model import Session, Event, identity, markdown, instant
-from .render import DEFAULT_BUDGET, RENDER_VERSION, compact, jsonl_bytes, native_plan
+from .render import DEFAULT_BUDGET, RENDER_VERSION, compact, fits_hook_output, hook_output_limit, injection_budget, jsonl_bytes, native_plan
 from .store import Store
 
 
@@ -151,6 +151,7 @@ def free_bytes(directory):
 
 class Engine:
     def __init__(self, adapters, directory, dry_run=False, config=None):
+        self._delivered = {}
         self.adapters = adapters
         self.directory = Path(directory).absolute()
         self.dry_run = dry_run
@@ -431,6 +432,11 @@ class Engine:
                         injected = normalize(first) == normalize(prepared)
                     except (OSError, UnicodeError):
                         pass
+            if binding and not launched and not injected and not self.delivered(session.endpoint, transfer):
+                # Earlier releases bound a context the harness discarded (over its hook output
+                # ceiling): the session never received it.
+                session.provenance = {}
+                return session
             if binding and not launched:
                 # The start hook put this context into a new session on its own; the user's
                 # turns may be any task. Link the source instead of merging its history.
@@ -504,6 +510,20 @@ class Engine:
         return bool(transfer and transfer.get("destination") == session.endpoint and session.events
                     and session.events[0].kind == "user" and isinstance(command, list) and command
                     and session.events[0].text == command[-1])
+
+    def delivered(self, endpoint, transfer):
+        """Whether a context bound to a session of endpoint could have reached it: a harness with a
+        hook output ceiling discards a larger answer. A pruned context cannot be measured: kept."""
+        adapter = self.adapters.get(endpoint)
+        if adapter is None or hook_output_limit(adapter) is None or not isinstance(transfer.get("context"), str):
+            return True
+        key = transfer.get("id")
+        if key not in self._delivered:
+            try:
+                self._delivered[key] = fits_hook_output(adapter, Path(transfer["context"]).read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeError):
+                self._delivered[key] = True
+        return self._delivered[key]
 
     @staticmethod
     def link(session, transfer, strip=0):
@@ -619,7 +639,7 @@ class Engine:
             old = self.store.legacy_target(session.source_path, destination)
             target, sid, records = native_plan(session, adapter, transfer_id, context, revision=revision, note=note)
             files[str(target)] = jsonl_bytes(records)
-            item.update(target=str(target), native_id=sid, target_sha=digest(files[str(target)]),
+            item.update(target=str(target), native_id=sid, target_sha=digest(files[str(target)]), target_size=len(files[str(target)]),
                         command=adapter.resume(sid), baseline_count=2,
                         baseline_sha=event_fingerprint(adapter.parse(records, SessionRef(sid, str(target))).events))
             if old:
@@ -717,10 +737,11 @@ class Engine:
                     return True
                 # Releases before 2.2.0 wrote an archived import back into sessions/; that
                 # unchanged copy does not make the conversation active again.
+                from .prune import unchanged  # migration-aware: Codex may have rewritten the copy
                 try:
-                    if target.is_file() and item.get("target_sha") and file_sha(target) == item["target_sha"]:
+                    if target.is_file() and item.get("target_sha") and unchanged(target, item):
                         return True
-                except OSError:
+                except (OSError, SyncError):
                     pass
         return False
 
@@ -838,7 +859,9 @@ class Engine:
                     if held.get(context_key, 0) > updated:
                         continue
                 try:
-                    transfer_id = self.transfer_id(session, target.endpoint, target.native_import, budget, revision=revision)
+                    # A context destination gets what its start hook injects (sized to its hook output).
+                    route_budget = budget if target.native_import else injection_budget(target, budget)
+                    transfer_id = self.transfer_id(session, target.endpoint, target.native_import, route_budget, revision=revision)
                     stored = self.store.transfer(transfer_id)
                     if self.complete(stored):
                         top = self.store.previous(session.key, target.endpoint)
@@ -849,7 +872,7 @@ class Engine:
                         continue
                     if target.native_import and self.archived_earlier(session.key, target.endpoint, revision):
                         continue
-                    item, files = self.plan(session, target.endpoint, budget=budget, _revision=revision, _serialization=serialization)
+                    item, files = self.plan(session, target.endpoint, budget=route_budget, _revision=revision, _serialization=serialization)
                     results.append(self.apply(item, files))
                 except (OSError, SyncError, ValueError) as exc:
                     self.errors.append("{} -> {}: {}".format(session.key, target.endpoint, exc))
@@ -859,7 +882,7 @@ class Engine:
                 self.considered(session, hot_stat)
         return results
 
-    def incoming(self, destination, project, exclude_session=None, budget=DEFAULT_BUDGET):
+    def incoming(self, destination, project, exclude_session=None, budget=None):
         max_age = injection_max_age(self.config)
         # Only a recently active conversation is injected, so only that window is scanned.
         days = 30 if max_age is None else max_age / 86400
@@ -875,6 +898,8 @@ class Engine:
             return None
         session = candidates[0]
         revision = self.revision_of(session)
+        if budget is None:
+            budget = injection_budget(self.adapters[destination]) if destination in self.adapters else DEFAULT_BUDGET
         stored = self.store.transfer(self.transfer_id(session, destination, False, budget, revision=revision))
         if self.complete(stored):
             return stored  # this exact handoff exists; a new session need not render it again

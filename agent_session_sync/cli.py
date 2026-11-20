@@ -21,7 +21,7 @@ from .engine import Engine
 from .io import SyncError, atomic_write, json_bytes, loads, normalized_workspace, write_output, digest, resolved_workspace
 from .model import Session, markdown, imported_snapshot
 from .prune import DEFAULT_RETENTION_DAYS, due as prune_due, mark_pruned, native_from, prune, retention_from
-from .render import DEFAULT_BUDGET
+from .render import DEFAULT_BUDGET, HOOK_OUTPUT_LIMITS, fits_hook_output, hook_output_limit, injection_output  # noqa: F401
 from .store import Busy, add_pending, has_pending, has_takeable, single_flight, take_pending
 
 
@@ -257,6 +257,19 @@ def injects(config, adapter, args, payload, existing):
 LAUNCH_SECONDS = 120
 
 
+def drop_launch_record(engine, adapter, project):
+    key = "launching:" + adapter.endpoint
+    row = engine.store.db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+    try:
+        _, workspace, started = json.loads(row[0]) if row else (None, None, 0)
+        fresh = row and time.time() - float(started) < LAUNCH_SECONDS and workspace == normalized_workspace(project)
+    except (ValueError, TypeError, SyncError):
+        fresh = False
+    if fresh:
+        engine.store.db.execute("DELETE FROM metadata WHERE key=?", (key,))
+        engine.store.db.commit()
+
+
 def launched_transfer(engine, adapter, project, existing):
     """The transfer an explicit open / handoff --launch started this session with, if any.
 
@@ -292,15 +305,6 @@ def launched_transfer(engine, adapter, project, existing):
     return None
 
 
-# Harnesses that discard a larger hook answer outright (Muse kills the hook past 16 KiB).
-HOOK_OUTPUT_LIMITS = {"muse": 16384}
-
-
-def hook_output_limit(adapter):
-    value = adapter.options.get("hook_output_limit", HOOK_OUTPUT_LIMITS.get(adapter.installation.harness))
-    return value if type(value) is int and value > 0 else None
-
-
 class Uninstalled(Exception):
     """The installation was purged while this process waited for the lock."""
 
@@ -309,16 +313,7 @@ def config_removed(args):
     """Whether the configuration this process started with was removed while it waited for the
     lock (uninstall --purge): it must not recreate the state that was purged."""
     selected = getattr(args, "config", None) or os.environ.get("AGENT_SESSION_SYNC_CONFIG")
-    return bool(selected) and not Path(selected).expanduser().is_file()
-
-
-def injection_output(adapter, context):
-    name = adapter.installation.harness
-    if name == "agy":
-        return {"injectSteps": [{"userMessage": context}]}
-    if name == "copilot":
-        return {"additionalContext": context}
-    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
+    return bool(selected) and not os.path.exists(os.path.expanduser(selected))
 
 
 def hook(engine, args, target=None):
@@ -343,6 +338,9 @@ def hook(engine, args, target=None):
     launch = None
     if not unreadable and may_inject(engine.config, adapter, args, payload):
         launch = launched_transfer(engine, adapter, project, existing)
+    elif unreadable:
+        # Nor may the next new session take the record: drop a fresh one for this workspace.
+        drop_launch_record(engine, adapter, project)
     if launch:
         # An explicit open / handoff --launch already carries its context: inject nothing more,
         # and bind the session to the launched transfer.
@@ -355,19 +353,17 @@ def hook(engine, args, target=None):
         # Native mirrors are available in their normal resume picker.
         request_sync(engine, args, project, adapter, sid)
         return {}
-    limit = hook_output_limit(adapter)
-    # A harness that drops a larger answer gets a context sized to fit (JSON escaping adds some).
-    budget = DEFAULT_BUDGET if limit is None else max(1024, min(DEFAULT_BUDGET, limit * 3 // 4))
-    item = engine.incoming(adapter.endpoint, project, sid, budget=budget)
+    # A harness that drops a larger answer gets a context sized to fit (see injection_budget).
+    item = engine.incoming(adapter.endpoint, project, sid)
     if not item:
         request_sync(engine, args, project, adapter, sid)
         return {}
     context = Path(item["context"]).read_text(encoding="utf-8-sig")
     output = injection_output(adapter, context)
-    if limit is not None and len(json.dumps(output, ensure_ascii=False).encode("utf-8")) + 1 > limit:
+    if not fits_hook_output(adapter, context):
         # The harness would discard it: inject nothing, and bind nothing it never received.
         print("agent-session-sync hook: the context exceeds {}'s {}-byte hook output; nothing injected".format(
-            adapter.installation.harness, limit), file=sys.stderr)
+            adapter.installation.harness, hook_output_limit(adapter)), file=sys.stderr)
         request_sync(engine, args, project, adapter, sid)
         return {}
     if sid:
@@ -386,6 +382,8 @@ def codex_delete(adapters):
     file prune checked is the only rollout of that id (none resumed elsewhere or archived)
     and Codex's index shows no turn or archive beyond the import's own.
     """
+    references = {}  # per Codex home, read once per prune
+
     def delete(destination, native_id, path, check=False, gone=()):
         adapter = adapters.get(destination)
         if adapter is None or adapter.installation.harness != "codex" or not adapter.installation.executable:
@@ -402,7 +400,11 @@ def codex_delete(adapters):
         except (OSError, ValueError, RuntimeError):
             return False
         # Exactly one copy: a plain file beside its .zst twin may differ from it (a continuation).
-        if len(copies) != 1 or not copies <= {target, Path(str(target) + ".zst")} or codex_thread_used(home, native_id, target):
+        if len(copies) != 1 or not copies <= {target, Path(str(target) + ".zst")}:
+            return False
+        if str(home) not in references:
+            references[str(home)] = codex_references(home)
+        if codex_thread_used(home, native_id, target, references[str(home)]):
             return False
         if check:
             return True  # a dry run asks only whether the copy could go
@@ -417,7 +419,28 @@ def codex_delete(adapters):
     return delete
 
 
-def codex_thread_used(home, native_id, target):
+UUID_BYTES = re.compile(rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def codex_references(home):
+    """Thread ids that a plain rollout's first record (its session_meta) names besides its own: a
+    fork names the thread it was forked from (history_base, forked_from_id). Over-inclusion only
+    keeps more threads. Compressed rollouts are not decompressed for this (Codex itself refuses
+    to delete a thread a fork depends on)."""
+    found = set()
+    for folder in ("sessions", "archived_sessions"):
+        for path in (home / folder).glob("**/rollout-*.jsonl"):
+            try:
+                with path.open("rb") as stream:
+                    line = stream.readline(4 << 20)
+            except OSError:
+                continue
+            own = re.search(r"([0-9a-f-]{36})\.jsonl$", path.name)
+            found.update(m.decode() for m in UUID_BYTES.findall(line) if not own or m.decode() != own.group(1))
+    return found
+
+
+def codex_thread_used(home, native_id, target, references=None):
     """Whether Codex shows the thread was used beyond the import: renamed (session_index.jsonl
     or a name), archived, pinned, filed into a section or project, pointing at another rollout,
     holding more than the import's single turn, or with queued messages, goals, attachments or
@@ -450,12 +473,18 @@ def codex_thread_used(home, native_id, target):
                 return True
             if any(row.get(field) for field in ("archived", "name", "is_pinned", "thread_section_id", "project_id")):
                 return True
+        with contextlib.closing(sqlite3.connect(state.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+            # A side chat attached to this thread depends on it.
+            if any(column[1] == "attached_thread_parent_id" for column in db.execute("PRAGMA table_info(threads)")) and \
+                    db.execute("SELECT 1 FROM threads WHERE attached_thread_parent_id=? LIMIT 1", (native_id,)).fetchone():
+                return True
+        if native_id in (codex_references(home) if references is None else references):
+            return True  # a fork depends on it
         if history is not None:
             with contextlib.closing(sqlite3.connect(history.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
                 turns = db.execute("SELECT count(*) FROM thread_turns WHERE thread_id=?", (native_id,)).fetchone()[0]
             if turns > 1:
                 return True
-        # State only Codex keeps for a thread, which `codex delete` would remove with it.
         # State only Codex keeps for a thread, which `codex delete` would remove with it. A table a
         # Codex version does not have holds none of it; any other error still counts as used.
         for pattern, table, query in (
@@ -528,6 +557,8 @@ def execute(args):
             raise
         # Queue the request, then try once more: the holder may have released the lock
         # (and checked the queue) while this process was still waiting.
+        if config_removed(args):
+            return 0  # uninstalled while waiting: queue nothing into the purged state
         if args.project or args.for_hook:
             add_pending(directory, {"project": args.project, "hook": args.for_hook})
         return drain_after_release(args, adapters, config, directory)
@@ -604,7 +635,7 @@ def run_hook(args, adapters, config, directory):
     except Busy:
         # A sync is running: hand it this hook's sync. Nothing is injected without the lock,
         # because only the index can say whether the injection is still due (see incoming).
-        request = fallback
+        request = None if config_removed(args) else fallback
     write_output(json.dumps(output, ensure_ascii=False))
     # Nothing may fail after the answer is written: the harness reads exactly one JSON object.
     if request:
@@ -729,6 +760,8 @@ def drain_after_release(args, adapters, config, directory):
             break
         try:
             with single_flight(directory):
+                if config_removed(args):
+                    return status  # uninstalled meanwhile: nothing to drain, nothing to recreate
                 engine = Engine(adapters, directory, False, config)
                 try:
                     taken = drain_pending(engine, directory, args)[1]

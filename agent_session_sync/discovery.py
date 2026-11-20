@@ -101,6 +101,9 @@ def validate_config(result):
                 args = value[field]
                 if not isinstance(args, list) or not args or any(not isinstance(arg, str) for arg in args) or not args[0].strip():
                     raise SyncError(label + "." + field + " must be a nonempty argument list")
+        limit = value.get("hook_output_limit")
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1024):
+            raise SyncError(label + ".hook_output_limit must be a whole number of bytes (at least 1024) or null")
         if "timeout" in value and (isinstance(value["timeout"], bool) or not isinstance(value["timeout"], (int, float))
                                    or not 0 < value["timeout"] <= 2147483):
             raise SyncError(label + ".timeout must be a positive number no greater than 2147483 seconds")

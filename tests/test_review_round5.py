@@ -109,9 +109,10 @@ class LaunchRecordEdges(CliWorkspace):
         finally:
             engine.close()
 
-    def test_an_unreadable_transcript_leaves_the_launch_record_alone(self):
-        # Round six: a transcript that exists already has content; the launched session is
-        # recognized later by its launch prompt's marker, an unrelated one must not take the record.
+    def test_an_unreadable_transcript_binds_nothing_and_drops_the_launch_record(self):
+        # Rounds six and seven: a transcript that exists already has content, so the launched
+        # session is recognized later by its launch prompt's marker; the record is dropped so the
+        # next unrelated new session cannot take it either.
         self.launch("copilot")
         transcript = self.base / "unreadable" / "events.jsonl"
         transcript.parent.mkdir()
@@ -122,7 +123,7 @@ class LaunchRecordEdges(CliWorkspace):
         self.assertIsNone(self.binding("copilot", "launched"))
         engine = self.engine()
         try:
-            self.assertIsNotNone(engine.store.db.execute("SELECT 1 FROM metadata WHERE key='launching:copilot'").fetchone())
+            self.assertIsNone(engine.store.db.execute("SELECT 1 FROM metadata WHERE key='launching:copilot'").fetchone())
         finally:
             engine.close()
 

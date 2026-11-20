@@ -435,8 +435,9 @@ def torn_suffix(line, after=1):
     end = len(line.rstrip(" \t\r"))
     decoder = json.JSONDecoder()
     absorbed = None  # whether the cut record parses to the end of the line (computed once, if needed)
-    # Each candidate may parse to the end of the line: past a bound (a deeply nested cut record)
-    # the line is left to the cut-short / invalid-JSON handling instead of quadratic work.
+    # The decoding work actually done is bounded: a deeply nested cut record, whose every candidate
+    # parses to the end of the line, is left to the cut-short / invalid-JSON handling instead of
+    # quadratic work; many small nested objects cost only their own length.
     examined, bound = 0, 32 * len(line) + 4096
     for match in re.finditer(r'\{\s*"', line):
         if match.start() < after:
@@ -459,15 +460,21 @@ def torn_suffix(line, after=1):
                     absorbed = True  # too deep to judge: as before, its nested objects are not records
             if absorbed:
                 continue
-        examined += end - match.start()
         if examined > bound:
             return None
         try:
             value, stop = decoder.raw_decode(line, match.start())
-            if stop == end and isinstance(value, dict):
-                return value, match.start()
-        except (ValueError, RecursionError):
+        except ValueError as exc:
+            # An unterminated string (or a plain ValueError) was scanned to the end of the line.
+            partial = isinstance(exc, json.JSONDecodeError) and not exc.msg.startswith("Unterminated string")
+            examined += (max(exc.pos, match.start() + 1) if partial else end) - match.start()
             continue
+        except RecursionError:
+            examined += end - match.start()
+            continue
+        examined += stop - match.start()
+        if stop == end and isinstance(value, dict):
+            return value, match.start()
     return None
 
 

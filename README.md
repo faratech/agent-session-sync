@@ -234,10 +234,12 @@ An empty route list disables automatic transfers. Explicit handoffs still work.
 `auto_handoff: false` globally or per harness disables startup context injection;
 `enabled: false` per harness excludes it from discovery.
 
-Muse discards a hook answer over 16 KiB, so its injected context is rendered to fit
-(about 12 KB instead of 32 KB). A context that still would not fit is not injected,
-and the session is not linked to it. A per-harness `hook_output_limit` (bytes)
-sets this ceiling for any harness.
+Muse discards a hook answer over 16 KiB, so its contexts are rendered to fit (about
+12 KB instead of 32 KB), by sync and by the start hook alike. A context that still
+would not fit is not injected, and the session is not linked to it. Sessions that
+earlier releases linked to a context Muse discarded are no longer linked. A
+per-harness `hook_output_limit` (bytes, at least 1024; `null` for none) sets this
+ceiling for any harness.
 
 Profiles sharing a startup-hook settings file are identified by their transcript
 paths. If a harness omits that path at startup, automatic context injection is

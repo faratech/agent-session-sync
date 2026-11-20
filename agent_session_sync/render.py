@@ -119,6 +119,46 @@ def compact(session, archive, transfer_id, budget=DEFAULT_BUDGET, note="", detai
     return body, list(dict.fromkeys(issues))
 
 
+# Harnesses that discard a larger hook answer outright (Muse kills the hook past 16 KiB).
+HOOK_OUTPUT_LIMITS = {"muse": 16384}
+
+
+def hook_output_limit(adapter):
+    """The byte ceiling of a harness's hook answer, or None. A per-harness hook_output_limit
+    overrides it (null: no ceiling); a malformed value keeps the built-in one."""
+    options = getattr(adapter, "options", None) or {}
+    default = HOOK_OUTPUT_LIMITS.get(adapter.installation.harness)
+    if "hook_output_limit" not in options:
+        return default
+    value = options["hook_output_limit"]
+    if value is None:
+        return None
+    return value if type(value) is int and value > 0 else default
+
+
+def injection_output(adapter, context):
+    name = adapter.installation.harness
+    if name == "agy":
+        return {"injectSteps": [{"userMessage": context}]}
+    if name == "copilot":
+        return {"additionalContext": context}
+    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
+
+
+def fits_hook_output(adapter, context):
+    """Whether the hook answer carrying context stays within the harness's ceiling (as written:
+    UTF-8 JSON and a newline)."""
+    limit = hook_output_limit(adapter)
+    return limit is None or len(json.dumps(injection_output(adapter, context), ensure_ascii=False).encode("utf-8")) + 1 <= limit
+
+
+def injection_budget(adapter, budget=DEFAULT_BUDGET):
+    """The context budget for a start-hook injection into adapter: sized to fit its hook output
+    ceiling (JSON escaping adds some), so the hook and sync render the same transfer."""
+    limit = hook_output_limit(adapter)
+    return budget if limit is None else max(1024, min(budget, limit * 3 // 4))
+
+
 def native_plan(session, adapter, transfer_id, context, legacy_target=None, revision=None, note=""):
     """Render a bounded context into a new native thread, with structural provenance."""
     first = next((e.timestamp for e in session.events if e.timestamp), timestamp())

@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 from .blobs import BLOB_DIR, references_from_file
-from .io import SyncError, zstd_decompress
+from .io import SyncError, zstd_content_size, zstd_decompress
 from .store import lineage_summary, load_document
 
 DEFAULT_RETENTION_DAYS = 3
@@ -252,15 +252,23 @@ def unchanged(stored, item):
     to exactly the import's two baseline events.
     """
     compressed = str(stored).endswith(".zst")
+    # A migration barely changes an import's size; a continued thread grows. One far larger than
+    # what was written is not read and parsed (on every prune) to learn that.
+    bound = 4 * item["target_size"] + (1 << 20) if type(item.get("target_size")) is int else 8 << 20
     if not compressed:
         if file_digest(stored) == item["target_sha"]:
             return True
         if not Path(stored).name.startswith("rollout-"):
             return False  # a Claude import must hold exactly what sync wrote
+        if Path(stored).stat().st_size > bound:
+            return False
         # Codex rewrites rollouts it migrates to paginated history (dropping this tool's
         # provenance and adding items) without new turns: compared by parse as a .zst is.
         content = Path(stored).read_bytes()
     else:
+        declared = zstd_content_size(stored)
+        if declared is not None and declared > bound:
+            return False
         content = zstd_decompress(stored, Path(stored).read_bytes())
         if hashlib.sha256(content).hexdigest() == item["target_sha"]:
             return True
