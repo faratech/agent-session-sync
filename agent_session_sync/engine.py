@@ -1,14 +1,16 @@
 """Harness-independent discovery, branching, transfer planning, and application."""
-import json
 import copy
+import hashlib
+import json
+import os
 import re
 import shutil
 import time
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .adapters import PARSER_VERSION, SessionRef, WORKSPACE_UNKNOWN
+from .adapters import PARSER_VERSION, SessionRef, WORKSPACE_UNKNOWN, choose_title
 from .blobs import Blob, archive_bytes, blob_dir, internalize, read_archive, write_blob
 from .io import SyncError, atomic_write, digest, json_bytes, loads, normalized_workspace, resolved_workspace, SharedArtifact, atomic_share
 from .model import Session, Event, identity, markdown, instant
@@ -26,6 +28,94 @@ def prefix_match(selector, key, native_id):
     return bool(selector) and (native_id.startswith(selector) or key.startswith(selector))
 
 
+# A transcript at least this large, written within HOT_SECONDS, is still being written:
+# its full document is not cached and its snapshots are rate-limited.
+HOT_BYTES = 32 * 1024 * 1024
+HOT_SECONDS = 120
+
+
+def hot(stat, now=None):
+    return bool(stat) and stat.st_size >= HOT_BYTES and (time.time() if now is None else now) - stat.st_mtime < HOT_SECONDS
+
+
+def grown_since(previous, path, stamp):
+    """True when a stored parse stamp describes an earlier, shorter state of the same append-only file
+    whose parser and cache inputs are unchanged, so the workspace parsed then still applies."""
+    if not previous or not stamp:
+        return False
+    source, old, _ = previous
+    return (source == path and isinstance(old, list) and len(old) == 4 and isinstance(old[1], int)
+            and old[1] < stamp[1] and old[2] == stamp[2] and old[3] == stamp[3])
+
+
+def keeps_workspace(adapter, path, size):
+    """Adapter.keeps_workspace for any adapter (plugins need not define it); unreadable is no."""
+    check = getattr(adapter, "keeps_workspace", None)
+    try:
+        return bool(check and check(path, size))
+    except (OSError, ValueError):
+        return False
+
+
+DEFAULT_HOT_MINUTES = 30
+
+
+def hot_interval(config):
+    """Seconds between snapshots of a large session still being written
+    (config hot_handoff_minutes; null, false or not positive: no limit)."""
+    value = (config or {}).get("hot_handoff_minutes", DEFAULT_HOT_MINUTES)
+    if value is None or value is False:
+        return None
+    try:
+        minutes = float(value)
+    except (TypeError, ValueError):
+        minutes = DEFAULT_HOT_MINUTES
+    return minutes * 60 if minutes > 0 else None
+
+
+DEFAULT_INJECT_HOURS = 2
+
+
+def injection_max_age(config):
+    """Seconds since its last activity within which a foreign conversation is injected into a
+    new session (config auto_handoff_max_age_hours; null, false or not positive: no limit)."""
+    value = (config or {}).get("auto_handoff_max_age_hours", DEFAULT_INJECT_HOURS)
+    if value is None or value is False:
+        return None
+    try:
+        hours = float(value)
+    except (TypeError, ValueError):
+        hours = DEFAULT_INJECT_HOURS
+    # Beyond a century (or not finite) is no limit: the window must stay a representable date.
+    return hours * 3600 if 0 < hours <= 24 * 365 * 100 else None
+
+
+def file_sha(path, chunk=1 << 20):
+    value = hashlib.sha256()
+    with open(str(path), "rb") as stream:
+        for block in iter(lambda: stream.read(chunk), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+def present(target):
+    """A native target exists: possibly as the .zst Codex compresses a cold rollout into, or
+    moved by `codex archive` into archived_sessions/ (the user archived it: not written again)."""
+    path = Path(target)
+    if path.is_file() or Path(str(path) + ".zst").is_file():
+        return True
+    if len(path.parts) >= 5 and path.parts[-5] == "sessions":
+        archived = path.parents[4] / "archived_sessions" / path.name
+        return archived.is_file() or Path(str(archived) + ".zst").is_file()
+    return False
+
+
+def inbox_path(directory, destination, workspace):
+    """The pointer to the newest context handoff for a destination and workspace."""
+    return Path(directory) / "inbox" / identity(destination) / identity(normalized_workspace(workspace)) / "latest.json"
+
+
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 DEFAULT_MIN_FREE_GB = 5
 
 
@@ -58,20 +148,44 @@ class Engine:
         self.config = config or {}
         self.store = Store(directory, dry_run)
         self.errors = []
+        # A hook's sync request, run by a detached process after the hook answers.
+        self.deferred = None
+        # Sources the last scan left out as still being written: (endpoint, workspace, mtime).
+        self.deferred_sources = []
+        # The parse stamp each scanned native session came from (see revision_of).
+        self.stamps = {}
+        # Parent archives read and verified by this process (see parent_archive).
+        self.parents = {}
+        # Codex import targets and the digests written there (see compressed_original).
+        self.written = None
 
     def close(self):
         self.store.close()
 
     def allowed(self, session, destination):
-        source = session.endpoint
+        return self.route_allowed(session.endpoint, session.workspace, destination)
+
+    def route_allowed(self, source, workspace, destination):
         routes = self.config.get("routes")
         return routes is None or any(r.get("from") == source and r.get("to") == destination
-            and (not r.get("project") or normalized_workspace(r["project"]) == normalized_workspace(session.workspace)) for r in routes)
+            and (not r.get("project") or normalized_workspace(r["project"]) == normalized_workspace(workspace)) for r in routes)
 
-    def scan(self, project=None, harness=None, days=30, force=False, selector=None):
+    def scan(self, project=None, harness=None, days=30, force=False, selector=None, defer=None):
+        """Sessions in scope, newest first. defer=(interval, fresh keys) leaves out large
+        sources still being written that sync handled within the interval (see sync);
+        they are listed in self.deferred_sources as (endpoint, workspace, updated)."""
         result = []
+        self.deferred_sources = []
         since = time.time() - days * 86400 if days is not None else 0
         project_key = normalized_workspace(project) if project else None
+        spellings = {}
+
+        def normalize(value):
+            # Many sessions share a few workspaces; resolve each spelling once per scan.
+            if value not in spellings:
+                spellings[value] = normalized_workspace(value)
+            return spellings[value]
+
         sources = []
         scoped = next((endpoint for endpoint, a in self.adapters.items()
                        if selector and selector.startswith(a.installation.harness + ":" + a.installation.profile + ":")), None)
@@ -94,7 +208,7 @@ class Engine:
             return selector is None or (selector in (key, native_id) if exact else prefix_match(selector, key, native_id))
 
         for endpoint, adapter, refs in sources:
-            refs = [ref for ref in refs if wanted(source_key(adapter, ref), ref.native_id)]
+            refs = [self.compressed_original(ref) for ref in refs if wanted(source_key(adapter, ref), ref.native_id)]
             if not refs:
                 continue
             refs, duplicates = self.unique_refs(refs)
@@ -115,8 +229,21 @@ class Engine:
                         continue
                     stamp = [st.st_mtime_ns, st.st_size, extra, cache_stamp] if st else None
                     key = source_key(adapter, ref)
-                    hint = self.store.workspace_hint(key, str(path.absolute()), stamp) if st and not force else None
-                    if project_key and hint and normalized_workspace(hint) != project_key:
+                    considered = self.throttled(key, st, defer[0]) if defer and key not in defer[1] else None
+                    if considered:
+                        # Its conversation time (not the file's), so it competes for context slots like the rest.
+                        self.deferred_sources.append((endpoint, considered[1], considered[2]))
+                        continue
+                    absolute = str(path.absolute())
+                    hint = self.store.workspace_hint(key, absolute, stamp) if st and not force else None
+                    known = hint
+                    if project_key and known is None and st and not force:
+                        # A transcript that only grew since its last parse keeps that parse's
+                        # workspace, so another project's active session is skipped unread.
+                        previous = self.store.last_workspace(key)
+                        if grown_since(previous, absolute, stamp) and keeps_workspace(adapter, absolute, previous[1][1]):
+                            known = previous[2]
+                    if project_key and known and normalize(known) != project_key:
                         continue
                     cached = self.store.cached(key, str(path.absolute()), stamp) if st and not force else None
                     try:
@@ -131,7 +258,11 @@ class Engine:
                         session.workspace = session.workspace or self.store.workspace(endpoint, ref.native_id)
                     if session.workspace:
                         session.issues = [issue for issue in session.issues if issue != WORKSPACE_UNKNOWN]
-                    if not cached:
+                    if not cached and hot(st):
+                        # Stale within seconds: keep only the workspace hint, not the full document.
+                        self.store.remember_workspace(session, stamp)
+                        self.store.db.commit()
+                    elif not cached:
                         self.store.remember(session, stamp)
                     elif hint != session.workspace:
                         self.store.remember_workspace(session, stamp)
@@ -146,14 +277,20 @@ class Engine:
                         self.store.db.commit()
                     if session is None or not session.events:
                         continue
-                    if project_key and normalized_workspace(session.workspace) != project_key:
+                    if project_key and normalize(session.workspace) != project_key:
                         continue
+                    self.stamps[session.key] = stamp
                     result.append(session)
                 except (SyncError, OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
                     self.errors.append("{}: {}".format(ref.path, exc))
         keys = {s.key for s in result}
         # Imports have no source file to stat; their newest event dates them.
-        oldest = datetime.fromtimestamp(since, timezone.utc) if days is not None else None
+        # timedelta, not fromtimestamp: a window reaching before 1970 must not raise (Windows),
+        # and one reaching before year 1 (or infinite) has no lower bound.
+        try:
+            oldest = EPOCH + timedelta(seconds=since) if days is not None else None
+        except (OverflowError, ValueError):
+            oldest = None
         for session in imports:
             try:
                 if oldest is not None and instant(session.updated) < oldest:
@@ -161,10 +298,38 @@ class Engine:
                 if (session.key not in keys and wanted(session.key, session.native_id)
                         and (not harness or harness in (session.harness, session.endpoint))
                         and (not project_key or normalized_workspace(session.workspace) == project_key)):
+                    # An imported snapshot's key names its content, so its revision can be memoized.
+                    self.stamps[session.key] = ["import"]
                     result.append(session)
             except SyncError as exc:
                 self.errors.append("{}: {}".format(session.key, exc))
         return sorted(result, key=lambda s: (instant(s.updated), s.key), reverse=True)
+
+    def compressed_original(self, ref):
+        """The ref to read for a Codex rollout that exists both plain and compressed.
+
+        Earlier releases wrote an import back beside the .zst Codex had compressed it into. When
+        the plain file is exactly that re-write (the recorded digest), the .zst is the thread:
+        it holds anything the user continued before Codex compressed it.
+        """
+        compressed = ref.path + ".zst"
+        if not ref.path.endswith(".jsonl") or not os.path.isfile(compressed):
+            return ref
+        if self.written is None:
+            self.written = {}
+            for (document,) in self.store.db.execute("SELECT document FROM transfers WHERE destination='codex' OR destination LIKE 'codex@%'"):
+                try:
+                    item = json.loads(document)
+                    self.written.setdefault(os.path.normpath(item["target"]), set()).add(item["target_sha"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+        expected = self.written.get(os.path.normpath(ref.path))
+        try:
+            if expected and file_sha(ref.path) in expected:
+                return SessionRef(ref.native_id, compressed)
+        except OSError:
+            pass
+        return ref
 
     @staticmethod
     def unique_refs(refs):
@@ -190,12 +355,18 @@ class Engine:
 
     def lineage(self, session):
         provenance = session.provenance
+        user_titled = bool(provenance.get("user_title"))
         if provenance.get("portable_import") or provenance.get("lineage_normalized"):
             return session
         binding = None
         if not provenance.get("transfer_id") or provenance.get("context"):
             binding = self.store.db.execute("SELECT value FROM metadata WHERE key=?",
                                            ("binding:{}:{}".format(session.endpoint, session.native_id),)).fetchone()
+        if (binding and provenance.get("context") and provenance.get("transfer_id") not in (None, binding[0])
+                and self.launched(session, self.store.transfer(provenance["transfer_id"]))):
+            # An explicit open / handoff --launch names its own transfer in its first prompt; the
+            # start hook may also have injected (and bound) another one. The launch wins.
+            binding = None
         mutable = bool(provenance.get("transfer_id") or provenance.get("legacy_import") or binding)
         if mutable:
             session = copy.copy(session)
@@ -226,24 +397,28 @@ class Engine:
             return session
         baseline_count = provenance.get("baseline_count", 0)
         if provenance.get("context"):
-            verified = False
+            # launched: the first prompt is the launch command of `open` / `handoff --launch`.
+            # injected: the first prompt is the prepared context itself.
+            launched, injected = self.launched(session, transfer), False
             if session.events and session.events[0].kind == "user" and transfer.get("destination") == session.endpoint:
                 first = session.events[0].text
-                command = transfer.get("command", [])
-                verified = bool(isinstance(command, list) and command and first == command[-1])
-                if not verified:
+                if not launched:
                     try:
                         prepared = Path(transfer["context"]).read_text(encoding="utf-8-sig")
                         def normalize(value):
                             return value.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
-                        verified = normalize(first) == normalize(prepared)
+                        injected = normalize(first) == normalize(prepared)
                     except (OSError, UnicodeError):
                         pass
-            if not verified and not binding:
+            if binding and not launched:
+                # The start hook put this context into a new session on its own; the user's
+                # turns may be any task. Link the source instead of merging its history.
+                return self.link(session, transfer, strip=1 if injected else 0)
+            if not (launched or injected):
                 session.provenance = {}
                 return session
-            baseline_count = 1 if verified else 0
-            if verified and transfer.get("mode") == "native":
+            baseline_count = 1
+            if transfer.get("mode") == "native":
                 baseline_count = transfer.get("baseline_count", 2)
         if not isinstance(baseline_count, int) or baseline_count < 0 or baseline_count > len(session.events):
             session.issues.append("import boundary changed; preserving complete branch snapshot")
@@ -263,21 +438,65 @@ class Engine:
             transfer = {"archive": str(archive), "source_key": provenance["source_key"], "source_revision": provenance["source_revision"]}
         if transfer:
             try:
-                parent = Session.from_dict(read_archive(transfer["archive"]))
-                if parent.key != transfer["source_key"] or parent.revision != transfer.get("source_revision"):
-                    raise SyncError("parent archive does not match its pinned identity/revision")
+                parent = self.parent_archive(transfer)
                 note = transfer.get("note", provenance.get("handoff_note", ""))
                 notes = [Event(identity(provenance.get("transfer_id", ""), "handoff-note"), "user", note)] if note else []
                 session.events = parent.events + notes + suffix
-                session.parent += "@" + parent.revision
+                session.parent += "@" + transfer["source_revision"]
                 session.workspace = session.workspace or parent.workspace
-                session.title = parent.title
+                if not user_titled:
+                    session.title = parent.title  # a title the user set on the continuation stays
             except (SyncError, OSError, ValueError):
                 session.issues.append("parent archive unavailable or invalid; keeping the continuation and its provenance")
         else:
             # No ownership is reconstructed from markers alone after ledger loss.
             session.events = suffix
             session.issues.append("transfer ledger unavailable; only the new continuation could be reconstructed")
+        return session
+
+    def parent_archive(self, transfer):
+        """The parent session a transfer pins, checked against its pinned key and revision.
+
+        Archives are write-once, so the check (a full serialization of the parent) runs once
+        per archive file state and is remembered; the parsed parent is reused in-process.
+        """
+        path = Path(transfer["archive"])
+        stat = path.stat()
+        expected = [stat.st_size, stat.st_mtime_ns, transfer["source_key"], transfer.get("source_revision")]
+        held = self.parents.get(str(path))
+        if held and held[0] == expected:
+            return held[1]
+        parent = Session.from_dict(read_archive(path))
+        row = self.store.db.execute("SELECT signature FROM verified_archives WHERE path=?", (str(path),)).fetchone()
+        if parent.key != transfer["source_key"] or not (row and loads(row[0]) == expected) and parent.revision != expected[3]:
+            raise SyncError("parent archive does not match its pinned identity/revision")
+        if not (row and loads(row[0]) == expected):
+            self.store.db.execute("INSERT OR REPLACE INTO verified_archives VALUES (?, ?)", (str(path), json.dumps(expected)))
+            self.store.db.commit()
+        self.parents[str(path)] = (expected, parent)
+        return parent
+
+    @staticmethod
+    def launched(session, transfer):
+        """The session's first prompt is the launch command `open` / `handoff --launch` gave it."""
+        command = (transfer or {}).get("command")
+        return bool(transfer and transfer.get("destination") == session.endpoint and session.events
+                    and session.events[0].kind == "user" and isinstance(command, list) and command
+                    and session.events[0].text == command[-1])
+
+    @staticmethod
+    def link(session, transfer, strip=0):
+        """A session that started with automatically injected context: its own turns and
+        title, with the injected conversation recorded as its parent rather than merged."""
+        own = session.events[strip:]
+        if strip and session.title == choose_title([e.text for e in session.events if e.kind == "user"], session.native_id):
+            # The title was derived from the injected context; derive it from the user's own turns.
+            session.title = choose_title([e.text for e in own if e.kind == "user"], session.native_id)
+        session.events = own
+        session.parent = "{}@{}".format(transfer["source_key"], transfer.get("source_revision", ""))
+        session.workspace = session.workspace or transfer.get("workspace", "")
+        session.provenance = dict(session.provenance, linked=True)
+        session.issues.append("started with context injected from {}; linked, not merged".format(transfer["source_key"]))
         return session
 
     def select(self, selector, project=None):
@@ -305,7 +524,7 @@ class Engine:
         return identity(session.key, revision or session.revision, destination, "native" if native else "context", str(budget), note, "renderer-" + str(RENDER_VERSION))
 
     def inbox_path(self, destination, workspace):
-        return self.directory / "inbox" / identity(destination) / identity(normalized_workspace(workspace)) / "latest.json"
+        return inbox_path(self.directory, destination, workspace)
 
     def complete(self, item):
         """Check artifact availability without re-rendering large conversations."""
@@ -313,9 +532,9 @@ class Engine:
             return False
         context = Path(item["context"])
         paths = [context, Path(item["archive"]), context.with_name("manifest.json"), context.with_name("transcript.md")]
-        if item.get("target"):
-            paths.append(Path(item["target"]))
         if not all(path.is_file() for path in paths):
+            return False
+        if item.get("target") and not present(item["target"]):
             return False
         try:
             pointer = json.loads(self.inbox_path(item["destination"], item["workspace"]).read_text(encoding="utf-8-sig"))
@@ -323,7 +542,8 @@ class Engine:
         except (OSError, ValueError, SyncError):
             return False
 
-    def plan(self, session, destination, mode="auto", budget=DEFAULT_BUDGET, note="", _revision=None, _serialization=None):
+    def plan(self, session, destination, mode="auto", budget=DEFAULT_BUDGET, note="", _revision=None, _serialization=None,
+             explicit=False):
         adapter = self.adapters.get(destination)
         if adapter is None:
             raise SyncError("unknown destination: " + destination)
@@ -344,6 +564,9 @@ class Engine:
                 "context": str(folder / "context.md"), "workspace": resolved_workspace(session.workspace),
                 "updated": session.updated, "issues": issues, "state": "planned"}
         item.update(renderer_version=RENDER_VERSION, note=note)
+        if explicit:
+            # Asked for by the user (handoff, open, sync --session): kept through the retention window.
+            item["explicit"] = True
         serialization = {} if _serialization is None else _serialization
         if serialization.get("identity") != (session.key, revision):
             serialization.clear()
@@ -403,6 +626,12 @@ class Engine:
                 continue
             expected = None
             target = path == item.get("target")
+            if target and not Path(path).exists() and present(path):
+                # Codex compressed or archived this import; writing it again would duplicate the thread.
+                # Keep the digest of what was written then, which is what the compressed copy holds.
+                if previous and previous.get("target_sha"):
+                    item = dict(item, target_sha=previous["target_sha"])
+                continue
             if target and Path(path).exists():
                 current = digest(Path(path).read_bytes())
                 if previous and previous.get("state") == "complete" and current != previous["target_sha"]:
@@ -447,17 +676,82 @@ class Engine:
     def handoff(self, session, destination, **kwargs):
         return self.apply(*self.plan(session, destination, **kwargs))
 
-    def sync(self, source=None, destination=None, project=None, days=30, budget=DEFAULT_BUDGET):
+    def throttled(self, key, stat, interval):
+        """For a large source still being written that sync handled within the interval,
+        the record of that pass: [handled at, workspace, conversation updated]; else None.
+
+        Each new revision writes a complete archive and transcript, so such a session is
+        handled at most once per interval; the session whose own hook asked for the sync is
+        exempt (see sync's fresh). A single handoff (an injection) does not count.
+        """
+        if not hot(stat):
+            return None
+        row = self.store.db.execute("SELECT value FROM metadata WHERE key=?", ("considered:" + key,)).fetchone()
+        try:
+            value = json.loads(row[0]) if row else None
+            return value if time.time() - float(value[0]) < interval else None
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def considered(self, session, stat):
+        """Remember that sync handled this large, still-written session (see throttled)."""
+        try:
+            updated = instant(session.updated).timestamp() if session.updated else 0
+        except (SyncError, ValueError, OverflowError):
+            updated = 0
+        self.store.db.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)",
+                              ("considered:" + session.key, json.dumps([time.time(), session.workspace, updated])))
+        self.store.db.commit()
+
+    def revision_of(self, session):
+        """session.revision, remembered against everything it is computed from.
+
+        A revision serializes every event, which costs seconds for a long session, while
+        an unchanged session's revision depends only on its parse stamp and the fields
+        scan and lineage settle: workspace, title, branch, parent, issues, provenance.
+        """
+        stamp = self.stamps.get(session.key)
+        if stamp is None:
+            return session.revision
+        memo = digest(json_bytes([stamp, session.workspace, session.title, session.branch, session.parent,
+                                  session.issues, session.provenance, len(session.events)]))
+        row = self.store.db.execute("SELECT revision FROM revisions WHERE key=? AND memo=?", (session.key, memo)).fetchone()
+        if row:
+            return row[0]
+        revision = session.revision
+        self.store.db.execute("INSERT OR REPLACE INTO revisions VALUES (?, ?, ?)", (session.key, memo, revision))
+        self.store.db.commit()
+        return revision
+
+    def sync(self, source=None, destination=None, project=None, days=30, budget=DEFAULT_BUDGET, fresh=None):
+        """Hand off every in-scope session. fresh: keys of sessions a hook just reported,
+        which are never deferred as still being written."""
         if source and not any(source in (key, adapter.installation.harness) for key, adapter in self.adapters.items()):
             raise SyncError("unknown source: " + source)
+        fresh = set(fresh or ())
+        interval = hot_interval(self.config)
         results = []
-        sessions = self.scan(project, source, days)
         targets = [a for key, a in self.adapters.items() if (not destination or destination == key)
                    and (a.installation.executable or destination)]
         if destination and destination not in self.adapters:
             raise SyncError("unknown destination: " + destination)
+        # A throttled source is skipped before it is parsed: reading a long session being
+        # written costs as much as the snapshot it would not get.
+        sessions = self.scan(project, source, days, defer=(interval, fresh) if interval else None)
         # One current source per project/destination prevents a context inbox from replaying old tasks.
-        context_seen = set()
+        # A deferred source is still that workspace's newest conversation where it is newer
+        # (both sides compare conversation times).
+        context_seen, held = set(), {}
+        for endpoint, workspace, written in self.deferred_sources:
+            try:
+                workspace_key = normalized_workspace(workspace) if workspace else None
+            except SyncError:
+                workspace_key = None
+            for target in targets:
+                if (workspace_key and not target.native_import and target.endpoint != endpoint
+                        and self.route_allowed(endpoint, workspace, target.endpoint)):
+                    slot = (workspace_key, target.endpoint)
+                    held[slot] = max(held.get(slot, 0), written)
         floor = min_free_bytes(self.config)
         for session in sessions:
             if floor and not self.dry_run and free_bytes(self.directory) < floor:
@@ -468,22 +762,33 @@ class Engine:
             if not session.workspace:
                 self.errors.append("{}: workspace unknown; skipped automatic handoff".format(session.key))
                 continue
+            hot_stat = None
+            if interval and session.source_path:
+                try:
+                    stat = Path(session.source_path).stat()
+                except OSError:
+                    stat = None
+                hot_stat = stat if hot(stat) else None
             try:
-                revision = session.revision
+                revision = self.revision_of(session)
                 workspace_key = normalized_workspace(session.workspace)
-            except (SyncError, ValueError) as exc:
+                updated = instant(session.updated).timestamp() if session.updated else 0
+            except (SyncError, ValueError, OverflowError) as exc:
                 self.errors.append("{}: {}".format(session.key, exc))
                 continue
-            serialization = {}
+            serialization, failed = {}, False
             for target in targets:
                 if source_endpoint == target.endpoint:
                     continue
                 if not self.allowed(session, target.endpoint):
                     continue
                 context_key = (workspace_key, target.endpoint)
-                if not target.native_import and context_key in context_seen:
-                    continue
-                context_seen.add(context_key)
+                if not target.native_import:
+                    if context_key in context_seen:
+                        continue
+                    context_seen.add(context_key)
+                    if held.get(context_key, 0) > updated:
+                        continue
                 try:
                     transfer_id = self.transfer_id(session, target.endpoint, target.native_import, budget, revision=revision)
                     if self.complete(self.store.transfer(transfer_id)):
@@ -492,14 +797,29 @@ class Engine:
                     results.append(self.apply(item, files))
                 except (OSError, SyncError, ValueError) as exc:
                     self.errors.append("{} -> {}: {}".format(session.key, target.endpoint, exc))
+                    failed = True
+            if hot_stat is not None and not failed and not destination:
+                # Handled for every destination: not again (except by its own hook) until the interval passes.
+                self.considered(session, hot_stat)
         return results
 
     def incoming(self, destination, project, exclude_session=None):
-        sessions = [s for s in self.scan(project=project) if not (s.native_id == exclude_session and
+        max_age = injection_max_age(self.config)
+        # Only a recently active conversation is injected, so only that window is scanned.
+        days = 30 if max_age is None else max_age / 86400
+        sessions = [s for s in self.scan(project=project, days=days) if not (s.native_id == exclude_session and
                     s.endpoint == destination) and (s.endpoint == destination or self.allowed(s, destination))]
         if sessions and sessions[0].endpoint == destination:
             return None
         candidates = [s for s in sessions if s.endpoint != destination and self.allowed(s, destination)]
+        if max_age is not None:
+            oldest = datetime.now(timezone.utc) - timedelta(seconds=max_age)
+            candidates = [s for s in candidates if instant(s.updated) >= oldest]
         if not candidates:
             return None
-        return self.handoff(candidates[0], destination, mode="context")
+        session = candidates[0]
+        revision = self.revision_of(session)
+        stored = self.store.transfer(self.transfer_id(session, destination, False, DEFAULT_BUDGET, revision=revision))
+        if self.complete(stored):
+            return stored  # this exact handoff exists; a new session need not render it again
+        return self.handoff(session, destination, mode="context", _revision=revision)

@@ -1,3 +1,4 @@
+import isolation  # noqa: F401  (first: keeps tests off the real state and config)
 import contextlib
 import io
 import json
@@ -141,7 +142,8 @@ class StateReviewTests(Workspace):
         first = self.base / "one.json"
         first.write_bytes(json_bytes(self.read("muse").to_dict()))
         config = self.base / "config.json"
-        config.write_bytes(json_bytes({"harnesses": {name: {"home": str(a.home)} for name, a in self.adapters.items()}}))
+        config.write_bytes(json_bytes({"harnesses": {name: {"home": str(a.home), "executable": sys.executable}
+                                                       for name, a in self.adapters.items()}}))
         def run(path):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 result = main(["import", str(path), "--config", str(config), "--state-dir", str(self.state), "--json"])

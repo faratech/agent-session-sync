@@ -2,6 +2,7 @@
 
 Run with: python3 tests/smoke_harnesses.py -v
 """
+import isolation  # noqa: F401  (first: keeps tests off the real state and config)
 import json
 import os
 import shutil

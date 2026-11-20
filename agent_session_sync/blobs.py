@@ -20,6 +20,7 @@ changed blob is an error, never a silent loss.
 import base64
 import binascii
 import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -132,6 +133,38 @@ def references(document):
         if match:
             names.add(match.group(1) + "." + match.group(2))
     return names
+
+
+BLOBS_KEY = b'\n  "blobs": '
+
+
+def references_from_file(path, chunk=65536):
+    """Blob file names an archive file references, read from its head.
+
+    json_bytes sorts keys and indents by two, so a v2 archive written here opens with
+    "archive_version" and then the "blobs" list, before any event: prune reads only
+    that list instead of the whole archive. Other layouts are parsed in full.
+    """
+    with open(str(path), "rb") as stream:
+        data = stream.read(chunk)
+        if V2_HEAD not in data[:64]:
+            return set()
+        start = data.find(BLOBS_KEY, 0, 512)
+        if start < 0:
+            return references(loads(data + stream.read()))
+        decoder = json.JSONDecoder()
+        while True:
+            # A multibyte character cut at the end of the buffer only shortens the tail.
+            text = data[start + len(BLOBS_KEY):].decode("utf-8", errors="ignore")
+            try:
+                entries = decoder.raw_decode(text)[0]
+                break
+            except ValueError:
+                more = stream.read(len(data))
+                if not more:
+                    raise ValueError("archive ends inside its blob list: {}".format(path))
+                data += more
+    return references({"archive_version": ARCHIVE_VERSION, "blobs": entries})
 
 
 def internalize(document, archive):

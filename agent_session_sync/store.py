@@ -1,7 +1,9 @@
 """Local index and durable transfer intents. Archives remain portable JSON."""
+import itertools
 import json
 import os
 import sqlite3
+import tempfile
 import time
 import zlib
 from contextlib import contextmanager
@@ -44,8 +46,29 @@ def load_document(value):
     return loads(decode_document(value))
 
 
+def lineage_summary(provenance, event_count):
+    """The fields retention needs from a session row (its sessions.lineage column), as JSON."""
+    value = {"events": event_count}
+    if isinstance(provenance, dict):
+        if isinstance(provenance.get("transfer_id"), str):
+            value["transfer_id"] = provenance["transfer_id"]
+        if type(provenance.get("baseline_count")) is int:
+            value["baseline_count"] = provenance["baseline_count"]
+    return json.dumps(value, sort_keys=True)
+
+
+def plain_path(path):
+    """A Codex rollout's path without the .zst suffix Codex adds when it compresses it."""
+    return path[:-4] if isinstance(path, str) and path.endswith(".jsonl.zst") else path
+
+
+class Busy(SyncError):
+    """Another process holds the sync lock."""
+
+
 @contextmanager
-def single_flight(directory, dry_run=False):
+def single_flight(directory, dry_run=False, wait=0):
+    """The state directory's sync mutex, waiting up to `wait` seconds for it."""
     if dry_run:
         yield
         return
@@ -59,19 +82,99 @@ def single_flight(directory, dry_run=False):
                 stream.write(b"\0")
                 stream.flush()
             stream.seek(0)
-            try:
+            def attempt():
                 msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError:
-                raise SyncError("another sync is already running")
         else:
             import fcntl
-            try:
+            def attempt():
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                attempt()
+                break
             except OSError:
-                raise SyncError("another sync is already running")
+                if time.monotonic() >= deadline:
+                    raise Busy("another sync is already running")
+                time.sleep(0.1)
         yield
     finally:
         stream.close()
+
+
+PENDING = "pending"
+_sequence = itertools.count()
+
+
+def add_pending(directory, request):
+    """Leave a sync request for the process holding the lock.
+
+    Each request is its own atomically created file, so concurrent requesters never
+    interleave and nothing renames a file another process may still hold open.
+    """
+    folder = Path(directory) / PENDING
+    folder.mkdir(parents=True, exist_ok=True)
+    name = "{:020d}-{}-{}.json".format(time.time_ns(), os.getpid(), next(_sequence))
+    # A dot-prefixed temporary file (ignored by readers) renamed into place: a reader never
+    # sees a partial request, even where hard links are unavailable. The name is unique.
+    descriptor, temporary = tempfile.mkstemp(prefix=".request-", dir=str(folder))
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write((json.dumps(request, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, str(folder / name))
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+# Requests this process took but could not remove (a lock or scanner holds the file): run
+# once, then ignored here, so one stuck file cannot make every drain repeat it.
+_stuck = set()
+
+
+def _pending_files(directory):
+    try:
+        return sorted(p for p in (Path(directory) / PENDING).iterdir()
+                      if p.suffix == ".json" and not p.name.startswith(".") and str(p) not in _stuck)
+    except OSError:
+        return []
+
+
+def take_pending(directory):
+    """Claim every queued sync request, oldest first and without repeats. Only the lock holder calls this.
+
+    A request that cannot be read yet stays for the next holder; a corrupt one is dropped.
+    """
+    requests = []
+    for path in _pending_files(directory):
+        try:
+            value = json.loads(path.read_bytes())
+        except FileNotFoundError:
+            continue
+        except ValueError:
+            value = None
+        except OSError:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            _stuck.add(str(path))
+            if value is None:
+                continue
+        if isinstance(value, dict) and value not in requests:
+            requests.append(value)
+    return requests
+
+
+def has_pending(directory):
+    return bool(_pending_files(directory))
 
 
 class Store:
@@ -144,8 +247,14 @@ class Store:
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS session_workspaces (
                 key TEXT PRIMARY KEY, source_path TEXT, stat TEXT, workspace TEXT);
+            CREATE TABLE IF NOT EXISTS revisions (key TEXT PRIMARY KEY, memo TEXT, revision TEXT);
+            CREATE TABLE IF NOT EXISTS verified_archives (path TEXT PRIMARY KEY, signature TEXT);
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(sessions)")}
+        if "lineage" not in columns:
+            # Filled by write_session; rows from older releases stay NULL until prune backfills them.
+            with self.db:
+                self.db.execute("ALTER TABLE sessions ADD COLUMN lineage TEXT")
         if "imported" not in columns:
             with self.db:
                 self.db.execute("ALTER TABLE sessions ADD COLUMN imported INTEGER NOT NULL DEFAULT 0")
@@ -223,6 +332,17 @@ class Store:
                               (key, path, json.dumps(stat))).fetchone()
         return row[0] if row else None
 
+    def last_workspace(self, key):
+        """(source path, stamp, workspace) of the last parse of key, whatever its stamp."""
+        row = self.db.execute("SELECT source_path, stat, workspace FROM session_workspaces WHERE key=?", (key,)).fetchone()
+        if not row:
+            return None
+        try:
+            stamp = json.loads(row[1]) if row[1] else None
+        except ValueError:
+            return None
+        return row[0], stamp, row[2]
+
     def remember_workspace(self, session, stat):
         self.db.execute("INSERT OR REPLACE INTO session_workspaces VALUES (?, ?, ?, ?)",
                         (session.key, session.source_path, json.dumps(stat), session.workspace))
@@ -232,8 +352,9 @@ class Store:
 
     def write_session(self, session, stat, imported):
         session.validate()
-        self.db.execute("INSERT OR REPLACE INTO sessions (key, source_path, stat, document, imported) VALUES (?, ?, ?, ?, ?)",
-                        (session.key, session.source_path, json.dumps(stat), encode_document(json.dumps(session.to_dict())), int(imported)))
+        self.db.execute("INSERT OR REPLACE INTO sessions (key, source_path, stat, document, imported, lineage) VALUES (?, ?, ?, ?, ?, ?)",
+                        (session.key, session.source_path, json.dumps(stat), encode_document(json.dumps(session.document())), int(imported),
+                         lineage_summary(session.provenance, len(session.events))))
         self.remember_workspace(session, stat)
 
     def remember(self, session, stat=None, imported=False):
@@ -283,10 +404,12 @@ class Store:
         self.db.commit()
 
     def legacy_target(self, source_path, destination):
+        source_path = plain_path(source_path)
         row = self.db.execute("SELECT * FROM legacy_targets WHERE source_path=? AND destination=?", (source_path, destination)).fetchone()
         return dict(row) if row else None
 
     def legacy_import_target(self, path):
+        path = plain_path(path)  # Codex may have compressed a registered target
         row = self.db.execute("SELECT * FROM legacy_targets WHERE target=?", (path,)).fetchone()
         if row:
             return row

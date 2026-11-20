@@ -1,3 +1,4 @@
+import isolation  # noqa: F401  (first: keeps tests off the real state and config)
 import contextlib
 import io
 import itertools
@@ -61,8 +62,10 @@ class Workspace(unittest.TestCase):
         self.patch.start()
         self.addCleanup(self.patch.stop)
 
-    def engine(self, dry=False):
-        engine = Engine(self.adapters, self.state, dry)
+    def engine(self, dry=False, config=None):
+        # Fixture conversations are dated 2026-10-15, so the default injection age limit
+        # is lifted here; tests of that limit pass their own config.
+        engine = Engine(self.adapters, self.state, dry, {"auto_handoff_max_age_hours": None} if config is None else config)
         self.addCleanup(engine.close)
         return engine
 

@@ -1,4 +1,5 @@
 """Regressions for the 2026-10-30 sweep: the memory companion."""
+import isolation  # noqa: F401  (first: keeps tests off the real state and config)
 import contextlib
 import io
 import os

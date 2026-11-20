@@ -399,7 +399,7 @@ def _setup(adapters, directory, config, config_path=None, uninstall=False, dry_r
         changes.append("purge state and logs: " + str(directory))
         if not dry_run:
             names = {"discovery.json", "sessions.sqlite3", "sessions.sqlite3-journal", "sessions.sqlite3-wal", "sessions.sqlite3-shm",
-                     "lock", "sync.log", "automation-config.json", "archives", "handoffs", "inbox", "state.json", "state-v1.json.bak"}
+                     "lock", "sync.log", "automation-config.json", "archives", "handoffs", "inbox", "pending", "state.json", "state-v1.json.bak"}
             if memories:
                 names.update({"memory-state.json", "memory.lock", "memory-sync.log"})
             # A process can still be waiting on these exact inodes. Unlinking

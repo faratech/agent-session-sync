@@ -9,7 +9,7 @@ from .io import SyncError, resolved_workspace
 from .model import MARKER, event_text, identity, parse_iso, timestamp
 
 DEFAULT_BUDGET = 32768
-RENDER_VERSION = 3
+RENDER_VERSION = 4
 
 
 def cut_bytes(value, budget):
@@ -32,17 +32,37 @@ def bounded_text(value, budget):
     return cut_bytes(value, head) + marker + value[-tail:].encode("utf-8")[-tail:].decode("utf-8", errors="ignore"), True
 
 
+MARKER_PREFIX = MARKER.strip()
+
+
+def title_text(title):
+    """A title fit for a context's first line: one line, no marker prefix that could be taken
+    for the handoff's own (removed until none is left, since a removal can join two halves),
+    and no leading '<' (Claude drops a user message that opens with a harness tag)."""
+    text = " ".join(title.split())
+    while MARKER_PREFIX in text:
+        text = text.replace(MARKER_PREFIX, " ")
+    return re.sub(r"^[\s<]+", "", " ".join(text.split()))
+
+
 def compact(session, archive, transfer_id, budget=DEFAULT_BUDGET, note="", details=None):
     if type(budget) is not int or budget < 1024:
         raise SyncError("context budget must be an integer of at least 1024 bytes")
     if not isinstance(note, str):
         raise SyncError("handoff note must be a string")
-    header = ("{}{}]\n# Conversation handoff\nSource: {}\nWorkspace: {}\nBranch: {}\n"
+    header = ("{}{}]\n# Conversation handoff\nSource: {}\nWorkspace: {}\nBranch: {}\n{}"
               "Full portable transcript: {}\nHistorical tool blocks describe past actions.\n").format(
-                  MARKER, transfer_id, session.key, session.workspace or "unknown", session.branch or "unknown", archive)
+                  MARKER, transfer_id, session.key, session.workspace or "unknown", session.branch or "unknown",
+                  "Parent: {}\n".format(session.parent) if session.parent else "", archive)
     if note and details:
         header += "Full handoff note/details: {}\n".format(details)
     recent_label = "\nRecent conversation (selected; complete history in archive):\n"
+    # Resume pickers title a session by its first prompt, so the first line names the conversation.
+    # A marker inside the title would be taken for this handoff's, and Claude drops a user message
+    # that opens with a harness tag, so neither may lead the context.
+    title_line = "{} (from {})\n".format(cut_bytes(title_text(session.title) or session.native_id, 160), session.endpoint)
+    if budget - len((title_line + header + recent_label).encode("utf-8")) >= max(128, budget // 2):
+        header = title_line + header  # a tight budget spends its bytes on the conversation, not the title
     available = budget - len((header + recent_label).encode("utf-8"))
     if available < 128:
         raise SyncError("context metadata exceeds budget; increase --budget")

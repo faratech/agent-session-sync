@@ -1,4 +1,5 @@
 """Regressions reproduced during the iterative correctness/performance review."""
+import isolation  # noqa: F401  (first: keeps tests off the real state and config)
 import json
 import io
 import contextlib
@@ -7,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 from argparse import Namespace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -129,7 +131,10 @@ class ReviewRegressions(Workspace):
         engine.store.db.commit()
         child = Session("muse", "same-id", str(self.project), [Event("u", "user", "New work turn.")], profile="work")
         default = Session("muse", "same-id", str(self.project), [Event("u", "user", "Independent turn.")])
-        self.assertEqual(len(engine.lineage(child).events), 5)
+        # A hook binding links the injected source (#123); it does not merge its history.
+        linked = engine.lineage(child)
+        self.assertEqual(len(linked.events), 1)
+        self.assertEqual(linked.parent, transfer["source_key"] + "@" + transfer["source_revision"])
         self.assertEqual(len(engine.lineage(default).events), 1)
         self.assertEqual(default.parent, "")
 
@@ -177,8 +182,13 @@ class SecondPassRegressions(Workspace):
 
     def test_recency_and_inbox_compare_instants_without_rewriting_events(self):
         engine = self.engine()
-        earlier = Session("external", "earlier", str(self.project), [Event("a", "user", "Earlier", "2026-10-15T12:00:00+02:00")], provenance={"portable_import": True})
-        later = Session("external", "later", str(self.project), [Event("b", "user", "Later", "2026-10-15T10:30:00Z")], provenance={"portable_import": True})
+        # Relative to now, so both stay inside the recency window: lexically "earlier" sorts
+        # after "later" (+02:00 local time), but it is the earlier instant.
+        base = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=30)
+        earlier_stamp = (base + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S+02:00")
+        later_stamp = (base + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        earlier = Session("external", "earlier", str(self.project), [Event("a", "user", "Earlier", earlier_stamp)], provenance={"portable_import": True})
+        later = Session("external", "later", str(self.project), [Event("b", "user", "Later", later_stamp)], provenance={"portable_import": True})
         earlier = engine.store.remember(earlier, imported=True)
         later = engine.store.remember(later, imported=True)
         self.assertEqual(engine.scan(days=None)[0].key, later.key)
@@ -187,7 +197,7 @@ class SecondPassRegressions(Workspace):
         engine.handoff(earlier, "muse")
         pointer = json.loads(engine.inbox_path("muse", str(self.project)).read_text(encoding="utf-8"))
         self.assertEqual(pointer["source_key"], later.key)
-        self.assertEqual(earlier.events[0].timestamp, "2026-10-15T12:00:00+02:00")
+        self.assertEqual(earlier.events[0].timestamp, earlier_stamp)
 
     def test_timestamp_precision_does_not_reverse_recency(self):
         session = Session("muse", "precision", str(self.project), [Event("a", "user", "earlier", "2026-10-15T10:00:00Z"),
@@ -347,9 +357,12 @@ class ThirdPassRegressions(Workspace):
         engine.store.db.execute("INSERT INTO metadata VALUES (?, ?)", ("binding:muse:" + source.native_id, transfer["id"]))
         engine.store.db.commit()
         result = engine.lineage(source)
-        self.assertEqual(len(result.events), len(parent.events) + len(source.events))
-        self.assertEqual(result.events[-len(source.events)].text, source.events[0].text)
+        # The binding names the parent; the session keeps its own turns and title (#123).
+        self.assertEqual(result.events, source.events)
+        self.assertEqual(result.events[0].text, source.events[0].text)
+        self.assertEqual(result.title, source.title)
         self.assertIn(parent.key, result.parent)
+        self.assertTrue(result.provenance.get("linked"))
 
     def test_small_context_budgets_handle_long_prompts_and_unicode(self):
         source = self.read("muse")
@@ -358,8 +371,10 @@ class ThirdPassRegressions(Workspace):
         for budget in (1024, 1536, 2048, 4096, 32768):
             for note in ("", "A handoff note. " + "界" * 500):
                 with self.subTest(budget=budget, note=bool(note)):
-                    body, issues = compact(source, self.base / "archive.json", "11111111-1111-4111-8111-111111111111", budget, note,
-                                           self.base / "manifest.json")
+                    # Short fixed paths: the header must not depend on how long the temp directory is.
+                    source.workspace = "/w"
+                    body, issues = compact(source, Path("/a/archive.json"), "11111111-1111-4111-8111-111111111111", budget, note,
+                                           Path("/a/manifest.json"))
                     self.assertLessEqual(len(body.encode("utf-8")), budget)
                     self.assertIn("LATEST CONCLUSION", body)
                     self.assertTrue(issues)
@@ -377,7 +392,7 @@ class ThirdPassRegressions(Workspace):
         engine = self.engine()
         source = self.read("muse")
         note = "Switch to the new requirements. " + "界" * 3000
-        result = engine.handoff(source, "claude", note=note, budget=1024)
+        result = engine.handoff(source, "claude", note=note, budget=2048)  # headroom for long temp paths (#143)
         manifest = json.loads(Path(result["context"]).with_name("manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["note"], note)
         path = Path(result["target"])

@@ -1,10 +1,11 @@
 """The version 1 portable session contract."""
 import json
 import copy
+import hashlib
 import math
 import re
 import uuid
-from dataclasses import asdict, dataclass, field as dataclass_field
+from dataclasses import asdict, dataclass, field as dataclass_field, fields
 from datetime import datetime, timezone
 
 from .io import LONE_SURROGATE, SyncError, digest, json_bytes
@@ -79,6 +80,31 @@ class Event:
         instant(self.timestamp)
 
 
+def event_fields(event):
+    """An event's fields as a dict that shares its values (asdict deep-copies them)."""
+    return {f.name: getattr(event, f.name) for f in EVENT_FIELDS}
+
+
+class Lazy(list):
+    """A list the pure-Python json encoder (JSONEncoder.iterencode) walks item by item,
+    converting each only as it is encoded. Not for json.dumps without an indent, whose C
+    encoder may read the (empty) list storage instead of iterating."""
+
+    def __init__(self, items, convert):
+        super().__init__()
+        self.items, self.convert = items, convert
+
+    def __len__(self):
+        return len(self.items)
+
+    def __iter__(self):
+        return (self.convert(item) for item in self.items)
+
+
+EVENT_FIELDS = fields(Event)
+REVISION_ENCODER = json.JSONEncoder(ensure_ascii=False, sort_keys=True, indent=2)
+
+
 @dataclass
 class Session:
     harness: str
@@ -121,7 +147,7 @@ class Session:
             raise SyncError("invalid portable event")
         if any(not isinstance(issue, str) for issue in self.issues):
             raise SyncError("portable issues must contain strings")
-        for field in ("portable_import", "legacy_import", "context"):
+        for field in ("portable_import", "legacy_import", "context", "linked", "user_title"):
             if field in self.provenance and not isinstance(self.provenance[field], bool):
                 raise SyncError("provenance.{} must be a boolean".format(field))
         if "version" in self.provenance and (type(self.provenance["version"]) is not int or self.provenance["version"] != 1):
@@ -153,9 +179,23 @@ class Session:
 
     @property
     def revision(self):
-        return digest(json_bytes({"key": self.key, "workspace": self.workspace,
-                                  "title": self.title, "branch": self.branch, "parent": self.parent, "issues": self.issues,
-                                  "events": [asdict(e) for e in self.events]}))
+        """sha256 of json_bytes of the identity fields and events, hashed as it is encoded.
+
+        The same bytes json_bytes would build (iterencode is what json.dumps joins), without
+        holding the whole indented document or deep copies of every event in memory.
+        """
+        value = hashlib.sha256()
+        document = {"key": self.key, "workspace": self.workspace, "title": self.title, "branch": self.branch,
+                    "parent": self.parent, "issues": self.issues, "events": Lazy(self.events, event_fields)}
+        try:
+            for chunk in REVISION_ENCODER.iterencode(document):
+                value.update(chunk.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise SyncError("value is not valid Unicode (lone surrogate): {}".format(exc))
+        except RecursionError:
+            raise SyncError("value is nested too deeply to serialize")
+        value.update(b"\n")
+        return value.hexdigest()
 
     @property
     def updated(self):
@@ -163,6 +203,16 @@ class Session:
 
     def to_dict(self):
         return asdict(self)
+
+    def document(self):
+        """to_dict's content without deep copies: the session's own values, for serializing only.
+
+        Events are a real list (of shallow dicts): the C json encoder used without an indent
+        may read a list subclass's storage directly instead of iterating it.
+        """
+        value = {f.name: getattr(self, f.name) for f in fields(self)}
+        value["events"] = [event_fields(event) for event in self.events]
+        return value
 
     @classmethod
     def from_dict(cls, value):

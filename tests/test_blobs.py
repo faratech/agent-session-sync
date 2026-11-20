@@ -1,3 +1,4 @@
+import isolation  # noqa: F401  (first: keeps tests off the real state and config)
 import base64
 import contextlib
 import hashlib

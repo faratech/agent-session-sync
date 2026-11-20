@@ -1,8 +1,10 @@
 """Strict transcript reading and private, atomic artifact writes."""
+import codecs
 import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
 import sys
 import ntpath
@@ -164,19 +166,36 @@ def exclusive_copy(path, data):
 
 
 def read_records(path):
-    """Read a consistent snapshot; only an invalid, unterminated tail is deferred."""
+    """Read a consistent snapshot; only an invalid, unterminated tail is deferred.
+
+    JSONL transcripts are append-only, so the bytes up to the size seen at open stay
+    valid while a harness keeps writing: they are read from the open handle and kept
+    when the same file has not shrunk. A single-document .json must be unchanged.
+    """
     path = Path(path)
-    before = path.stat()
-    raw = path.read_bytes()
+    with path.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        raw = stream.read(before.st_size)
     after = path.stat()
-    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+    same = (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+    if path.suffix.lower() in (".json", ".zst"):
+        consistent = same and (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
+    else:
+        # Only growth is an append. An unchanged size with a new mtime is an in-place rewrite,
+        # and a smaller file was rewritten even when a coarse clock kept its mtime.
+        consistent = same and len(raw) == before.st_size and (
+            after.st_size > before.st_size or (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns))
+    if not consistent:
         raise SyncError("transcript changed while reading; retry: {}".format(path))
     issues = []
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise SyncError("invalid UTF-8 in {}: {}".format(path, exc))
+    if path.suffix.lower() == ".zst":
+        # Codex compresses cold rollouts; the whole file is one zstd frame of JSONL.
+        raw = zstd_decompress(path, raw)
     if path.suffix.lower() == ".json":
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise SyncError("invalid UTF-8 in {}: {}".format(path, exc))
         try:
             value = loads(text)
         except ValueError as exc:
@@ -192,19 +211,40 @@ def read_records(path):
         return value, issues, digest(raw)
     records, truncated = [], None
     # JSON permits U+0085/U+2028/U+2029 inside strings; splitlines treats those
-    # as separators too. Only LF (with optional CR) delimits JSONL records.
-    lines = text.split("\n")
-    for index, line in enumerate(lines):
+    # as separators too. Only LF (with optional CR) delimits JSONL records. Lines are
+    # decoded one at a time (LF never occurs inside a multibyte UTF-8 sequence), so a
+    # large transcript is not also held as one decoded string and a list of lines.
+    start = len(codecs.BOM_UTF8) if raw.startswith(codecs.BOM_UTF8) else 0
+    index, last = -1, False
+    while not last:
+        end = raw.find(b"\n", start)
+        last = end < 0
+        index += 1
+        chunk, bad = (raw[start:] if last else raw[start:end]), None
+        try:
+            line = chunk.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            if last:
+                # A record still being written can end inside a multibyte character.
+                issues.append("incomplete trailing record deferred")
+                break
+            # A record cut short or torn inside a multibyte character: keep the bad bytes as lone
+            # surrogates (strict decoding never yields them) and let the recovery below decide.
+            bad = SyncError("invalid UTF-8 in {}: line {}: {}".format(path, index + 1, exc))
+            line = chunk.decode("utf-8", "surrogateescape")
+        start = end + 1
         if not line.strip(" \t\r"):
             continue
         try:
-            record = loads(line)
+            found = [loads(line)]
+            if bad is not None:
+                raise bad  # invalid bytes inside a record that is otherwise complete
         except ValueError as exc:
-            if index == len(lines) - 1 and not line.endswith(("\n", "\r")):
+            if last and not line.endswith(("\n", "\r")):
                 issues.append("incomplete trailing record deferred")
                 break
-            record = torn_suffix(line)
-            if record is None:
+            found = salvage(line, bad, issues, index + 1)
+            if found is None:
                 # Power loss can also leave NUL padding where the rest of the record should be.
                 cut_short = exc.msg.startswith("Unterminated string") or exc.pos >= len(line.rstrip(" \t\r\x00"))
                 if not cut_short or truncated is not None:
@@ -212,33 +252,162 @@ def read_records(path):
                 # A crash can cut a record short; it is skipped only once the writer is seen to continue.
                 truncated = (index + 1, exc)
                 continue
-            # Interleaved writers can leave a cut-off record glued to a complete one.
-            issues.append("torn record at line {} dropped; its complete successor was kept".format(index + 1))
-        if not isinstance(record, dict):
+        if any(not isinstance(record, dict) for record in found):
             raise SyncError("expected object at {}:{}".format(path, index + 1))
         if truncated is not None:
             issues.append("record cut short at line {} dropped; later records were kept".format(truncated[0]))
             truncated = None
-        records.append(record)
+        records.extend(found)
     if truncated is not None:
         raise SyncError("invalid JSON at {}:{}: {}".format(path, truncated[0], truncated[1]))
     return records, issues, digest(raw)
 
 
-def torn_suffix(line):
-    """The complete object ending a line whose start was cut off by another writer."""
+def find_program(name):
+    """shutil.which over the absolute PATH entries only: on Windows, which also searches the
+    current directory first, where an untrusted checkout could plant the program."""
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if entry and os.path.isabs(entry) and os.path.normcase(os.path.abspath(entry)) != os.path.normcase(os.getcwd()):
+            found = shutil.which(os.path.join(entry, name))
+            if found:
+                return found
+    return None
+
+
+_ZSTD = []
+
+
+def zstd_available():
+    """Whether some zstd decoder exists here (checked once per process)."""
+    if not _ZSTD:
+        try:
+            from compression import zstd  # noqa: F401
+            _ZSTD.append(True)
+        except ImportError:
+            try:
+                import zstandard  # noqa: F401
+                _ZSTD.append(True)
+            except ImportError:
+                _ZSTD.append(find_program("zstd") is not None)
+    return _ZSTD[0]
+
+
+def zstd_decompress(path, data):
+    """The content of a zstd file: Python 3.14's compression.zstd, else zstandard, else the zstd command."""
+    try:
+        from compression import zstd
+    except ImportError:
+        zstd = None
+    if zstd is not None:
+        try:
+            return zstd.decompress(data)
+        except Exception as exc:  # compression.zstd.ZstdError and friends
+            raise SyncError("cannot decompress {}: {}".format(path, exc))
+    try:
+        import zstandard
+    except ImportError:
+        zstandard = None
+    if zstandard is not None:
+        # Frame by frame, refusing empty or truncated input as compression.zstd and zstd do.
+        if not data:
+            raise SyncError("cannot decompress {}: empty file".format(path))
+        parts = []
+        try:
+            while data:
+                stream = zstandard.ZstdDecompressor().decompressobj()
+                parts.append(stream.decompress(data))
+                if not stream.eof:
+                    raise SyncError("cannot decompress {}: truncated".format(path))
+                data = stream.unused_data
+        except zstandard.ZstdError as exc:
+            raise SyncError("cannot decompress {}: {}".format(path, exc))
+        return b"".join(parts)
+    command = find_program("zstd")
+    if command is None:
+        raise SyncError("reading compressed {} needs Python 3.14, the zstandard package, or the zstd command".format(path))
+    import subprocess
+    try:
+        result = subprocess.run([command, "-dc"], input=data, capture_output=True, timeout=300,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SyncError("cannot decompress {}: {}".format(path, exc))
+    if result.returncode:
+        raise SyncError("cannot decompress {}: {}".format(path, result.stderr.decode("utf-8", "replace").strip()))
+    return result.stdout
+
+
+def appended_matches(path, start, pattern, chunk=1 << 20):
+    """Whether the bytes of path after offset start match a compiled bytes pattern."""
+    with open(str(path), "rb") as stream:
+        stream.seek(start)
+        carry = b""
+        while True:
+            block = stream.read(chunk)
+            if not block:
+                return False
+            data = carry + block
+            if pattern.search(data):
+                return True
+            carry = data[-256:]
+
+
+# Bytes that were not UTF-8, as surrogateescape keeps them; strict decoding never yields these.
+ESCAPED_BYTE = re.compile("[\udc80-\udcff]")
+
+
+def torn_suffix(line, after=1):
+    """(object, its offset) for the complete object ending a line whose start was cut off by
+    another writer, unscrubbed; None when there is none."""
     end = len(line.rstrip(" \t\r"))
     decoder = json.JSONDecoder()
     for match in re.finditer(r'\{\s*"', line):
-        if match.start() == 0:
+        if match.start() < after:
             continue
         try:
             value, stop = decoder.raw_decode(line, match.start())
             if stop == end and isinstance(value, dict):
-                return scrub(value) if SURROGATE_ESCAPE.search(line, match.start()) else value
+                return value, match.start()
         except (ValueError, RecursionError):
             continue
     return None
+
+
+def salvage(line, bad, issues, number):
+    """Records recoverable from a line that is not one JSON object, or None.
+
+    A complete record followed by NUL padding (a crash before the writer continued) is kept,
+    as is a complete record glued to the next one; otherwise the complete successor of a
+    record cut off by an interleaved writer is kept. A kept record holding bytes that were
+    not UTF-8 makes the line invalid (raises bad); this is checked before any scrubbing.
+    """
+    kept = []
+    try:
+        value, stop = json.JSONDecoder().raw_decode(line, 0)
+    except (ValueError, RecursionError):
+        value, stop = None, 0
+    if isinstance(value, dict) and stop < len(line):
+        following = stop + len(line[stop:]) - len(line[stop:].lstrip(" \t\r\x00"))
+        if following == len(line):
+            kept.append((value, 0, stop))
+            issues.append("NUL padding after the record at line {} ignored".format(number))
+        else:
+            successor = torn_suffix(line, following)
+            if successor is not None and successor[1] == following:
+                kept = [(value, 0, stop), (successor[0], following, len(line))]
+                issues.append("two records joined on line {} were split".format(number))
+    if not kept:
+        successor = torn_suffix(line)
+        if successor is None:
+            return None
+        kept.append((successor[0], successor[1], len(line)))
+        # Interleaved writers can leave a cut-off record glued to a complete one.
+        issues.append("torn record at line {} dropped; its complete successor was kept".format(number))
+    if bad is not None and any(ESCAPED_BYTE.search(line, start, stop) for _, start, stop in kept):
+        raise bad
+    try:
+        return [scrub(value) if SURROGATE_ESCAPE.search(line, start, stop) else value for value, start, stop in kept]
+    except RecursionError:
+        return None  # nested too deeply to be a record; refused like any invalid line
 
 
 def atomic_write(path, data, expected=None, replace=False):

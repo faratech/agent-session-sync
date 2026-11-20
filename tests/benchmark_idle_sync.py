@@ -1,4 +1,5 @@
 """Repeatable synthetic idle-sync benchmark: python3 tests/benchmark_idle_sync.py."""
+import isolation  # noqa: F401  (first: keeps tests off the real state and config)
 import json
 import statistics
 import sys

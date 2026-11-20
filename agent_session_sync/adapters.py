@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .discovery import Installation
-from .io import SyncError, read_records, digest, loads, workspace_path
+from .io import SyncError, appended_matches, read_records, digest, loads, workspace_path, zstd_available
 from .model import Event, Session, MARKER, identity, timestamp
 
 WORKSPACE_UNKNOWN = "workspace unknown; supply workspace_map or capture a hook notification"
@@ -71,6 +71,13 @@ class Adapter:
     def discover(self):
         raise NotImplementedError
 
+    def keeps_workspace(self, path, size):
+        """Whether records appended to the transcript at path after its first `size` bytes leave
+        the workspace parsed from those bytes unchanged, so a scan scoped to another project may
+        skip the grown file unread. Only append-only transcripts whose head settles the
+        workspace say yes; by default the file is read again."""
+        return False
+
     def read(self, ref):
         records, issues, source_sha = read_records(ref.path)
         try:
@@ -94,6 +101,9 @@ class Adapter:
                 if match:
                     session.provenance = {"transfer_id": match.group(1), "context": True}
                     break
+        if getattr(session, "user_title", False):
+            # Kept with the parse (cached), so a continuation's merge keeps the user's title.
+            session.provenance = dict(session.provenance, user_title=True)
         session.validate()
         return session
 
@@ -131,10 +141,32 @@ class Codex(Adapter):
     native_import = True
     format_name = "rollout JSONL (session_meta / response_item)"
 
+    def keeps_workspace(self, path, size):
+        return not str(path).endswith(".zst")  # the first session_meta names the workspace
+
+    def read(self, ref):
+        try:
+            return super().read(ref)
+        except FileNotFoundError:
+            # Codex compressed the rollout between discovery and this read.
+            if ref.path.endswith(".zst") or not Path(ref.path + ".zst").is_file():
+                raise
+            return super().read(SessionRef(ref.native_id, ref.path + ".zst"))
+
     def discover(self):
+        plain = set()
         for path in sorted((self.home / "sessions").glob("**/rollout-*.jsonl")):
             match = re.search(r"([a-f0-9-]{36})\.jsonl$", path.name)
             if match:
+                plain.add(match.group(1))
+                yield SessionRef(match.group(1), str(path))
+        # Codex compresses cold rollouts and removes the plain file. Without a zstd decoder they are
+        # skipped, as before compressed rollouts were read, instead of failing every sync.
+        if not zstd_available():
+            return
+        for path in sorted((self.home / "sessions").glob("**/rollout-*.jsonl.zst")):
+            match = re.search(r"([a-f0-9-]{36})\.jsonl\.zst$", path.name)
+            if match and match.group(1) not in plain:
                 yield SessionRef(match.group(1), str(path))
 
     def parse(self, records, ref):
@@ -187,9 +219,18 @@ class Codex(Adapter):
         return session
 
 
+NEW_ROOT = re.compile(rb'"parentUuid"\s*:\s*null')
+SESSION_START = re.compile(rb'"session\.start"')
+
+
 class Claude(Adapter):
     native_import = True
     format_name = "project JSONL (user / assistant)"
+
+    def keeps_workspace(self, path, size):
+        # The active chain's first record names the workspace; only a new root (an edited
+        # first prompt, a compaction boundary) can change which record that is.
+        return not appended_matches(path, size, NEW_ROOT)
 
     def discover(self):
         for path in sorted((self.home / "projects").glob("*/*.jsonl")):
@@ -199,8 +240,8 @@ class Claude(Adapter):
     def parse(self, records, ref):
         session = self.session(ref)
         # Claude Code names sessions itself; a user rename wins over its generated title.
-        named = [t for t in (r.get("customTitle") for r in records if r.get("type") == "custom-title") if isinstance(t, str) and t.strip()] or \
-                [t for t in (r.get("aiTitle") for r in records if r.get("type") == "ai-title") if isinstance(t, str) and t.strip()]
+        renamed = [t for t in (r.get("customTitle") for r in records if r.get("type") == "custom-title") if isinstance(t, str) and t.strip()]
+        named = renamed or [t for t in (r.get("aiTitle") for r in records if r.get("type") == "ai-title") if isinstance(t, str) and t.strip()]
         summaries = set()
         if any(r.get("isMeta") and text((r.get("message") or {}).get("content", "")).startswith("[Imported from OpenAI Codex CLI session") for r in records[:5]):
             session.provenance = {"legacy_import": True}
@@ -303,6 +344,7 @@ class Claude(Adapter):
             flush_text()
         if named:
             session.title = named[-1].strip()[:100]
+            session.user_title = bool(renamed)  # transient: read() records it in provenance
         elif summaries:
             # A compaction summary restates earlier work; it never names this session.
             session.title = choose_title([e.text for e in session.events if e.kind == "user" and e.text not in summaries], session.native_id)
@@ -367,6 +409,9 @@ def with_side_records(chain, every):
 
 class Muse(Adapter):
     format_name = "journal schema_version=1 / export_schema_version=1"
+
+    def keeps_workspace(self, path, size):
+        return Path(path).suffix.lower() != ".json"  # a journal's first metadata wins; an export is rewritten whole
 
     def discover(self):
         for path in sorted((self.home / "sessions").glob("*/*/*/*/session.jsonl")):
@@ -464,6 +509,9 @@ class Muse(Adapter):
 class Antigravity(Adapter):
     format_name = "step transcripts (USER_INPUT / PLANNER_RESPONSE)"
 
+    def keeps_workspace(self, path, size):
+        return True  # workspace caches are part of the parse stamp; otherwise the first record wins
+
     def discover(self):
         for directory in sorted((self.home / "brain").glob("*/.system_generated/logs")):
             path = directory / "transcript_full.jsonl"
@@ -535,6 +583,10 @@ class Antigravity(Adapter):
 
 class Copilot(Adapter):
     format_name = "persisted session events (user.message / assistant.message)"
+
+    def keeps_workspace(self, path, size):
+        # The latest session.start names the workspace; a resume from another directory appends one.
+        return not appended_matches(path, size, SESSION_START)
 
     def discover(self):
         for path in sorted((self.home / "session-state").glob("*/events.jsonl")):

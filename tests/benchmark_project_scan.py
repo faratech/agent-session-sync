@@ -1,4 +1,5 @@
 """Synthetic project-filter benchmark with an unrelated 8 MiB history."""
+import isolation  # noqa: F401  (first: keeps tests off the real state and config)
 import json
 import statistics
 import sys
@@ -28,6 +29,18 @@ def main():
                 samples.append((time.perf_counter() - start) * 1000)
             print(json.dumps({"iterations": len(samples), "history_mib": 8,
                               "median_ms": round(statistics.median(samples), 3), "document_reads": cached.call_count}))
+        # The unrelated history keeps growing, as a session being written does (#128).
+        samples = []
+        adapter = fixture.adapters["muse"]
+        with mock.patch.object(adapter, "read", wraps=adapter.read) as read:
+            for index in range(20):
+                fixture.append(source, {"schema_version": 1, "sequence": 1000 + index, "payload": {"kind": "event", "run_id": "r1",
+                               "event": {"kind": "assistant_message_committed", "text": "more " + str(index)}}})
+                start = time.perf_counter()
+                engine.scan(project=str(fixture.base / "unrelated-project"), days=None)
+                samples.append((time.perf_counter() - start) * 1000)
+            print(json.dumps({"case": "growing", "iterations": len(samples), "history_mib": 8,
+                              "median_ms": round(statistics.median(samples), 3), "transcript_reads": read.call_count}))
     finally:
         fixture.doCleanups()
 

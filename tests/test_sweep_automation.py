@@ -1,4 +1,5 @@
 """Regressions for the 2026-10-30 sweep: hooks, scheduler entries, and command ownership."""
+import isolation  # noqa: F401  (first: keeps tests off the real state and config)
 import json
 import os
 import sys

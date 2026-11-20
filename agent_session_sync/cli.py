@@ -1,5 +1,6 @@
 """CLI entry point. No arguments automatically sync all detected harnesses."""
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -7,20 +8,21 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__
 from .adapters import SessionRef, get_adapters
 from .blobs import archive_bytes, blob_dir, compact_archives, internalize, read_archive, write_blob
-from .automation import setup, shell_command, settings_path
+from .automation import entry_command, setup, shell_command, settings_path
 from .discovery import discover, load_config, state_dir
 from .engine import Engine
-from .io import SyncError, atomic_write, json_bytes, loads, write_output, digest, resolved_workspace
+from .io import SyncError, atomic_write, json_bytes, loads, normalized_workspace, write_output, digest, resolved_workspace
 from .model import Session, markdown, imported_snapshot
-from .prune import DEFAULT_RETENTION_DAYS, due as prune_due, mark_pruned, prune, retention_from
+from .prune import DEFAULT_RETENTION_DAYS, due as prune_due, mark_pruned, native_from, prune, retention_from
 from .render import DEFAULT_BUDGET
-from .store import single_flight
+from .store import Busy, add_pending, has_pending, single_flight, take_pending
 
 
 class UsageError(Exception):
@@ -80,15 +82,20 @@ def parser():
     command.add_argument("--days", type=float, default=30)
     command.add_argument("--session")
     command.add_argument("--budget", type=int, default=DEFAULT_BUDGET)
+    # Internal: a hook's detached sync, queued for the lock holder when the lock is taken.
+    command.add_argument("--queued", action="store_true", help=argparse.SUPPRESS)
+    command.add_argument("--for-hook", nargs=3, metavar=("ENDPOINT", "SESSION", "EVENT"), help=argparse.SUPPRESS)
     for name in ("install", "uninstall"):
         command = subs.add_parser(name, parents=[common])
         command.add_argument("--no-cron", action="store_true")
         command.add_argument("--no-hooks", action="store_true")
         command.add_argument("--memories", action="store_true")
         command.add_argument("--purge", action="store_true")
-    command = subs.add_parser("prune", parents=[common], help="remove superseded archive snapshots and handoff folders")
+    command = subs.add_parser("prune", parents=[common],
+                              help="remove superseded archive snapshots, handoff folders and imported conversation copies")
     command.add_argument("--keep-days", type=float, default=None,
-                         help="keep anything written within this many days (default: retention_days in the config, else 3)")
+                         help="retention window for archive snapshots and handoff folders (default: retention_days in the "
+                              "config, else 3); superseded imports nobody resumed go after an hour (see prune_native_copies)")
     command.add_argument("--compact-store", action="store_true",
                          help="also move inline images out of older archives and compress the index (one-time conversion)")
     command = subs.add_parser("update", parents=[common], help="update this install and refresh its automation")
@@ -97,6 +104,8 @@ def parser():
     command = subs.add_parser("hook", parents=[common], help="internal lifecycle handler")
     command.add_argument("--harness", required=True)
     command.add_argument("--event", choices=("start", "stop"), required=True)
+    # Run the sync inside the hook instead of a detached process.
+    command.add_argument("--inline", action="store_true", help=argparse.SUPPRESS)
     return root
 
 
@@ -131,8 +140,11 @@ def emit(value, args):
             write_output(json.dumps(value, ensure_ascii=False, indent=2))
 
 
-def hook(engine, args):
-    payload = json.loads(getattr(sys.stdin, "buffer", sys.stdin).read())
+def hook_payload(args):
+    """The hook's JSON payload, read from stdin once and validated."""
+    payload = getattr(args, "payload", None)
+    if payload is None:
+        payload = json.loads(getattr(sys.stdin, "buffer", sys.stdin).read())
     if not isinstance(payload, dict):
         raise SyncError("hook payload must be a JSON object")
     for field in ("cwd", "session_id", "sessionId", "conversationId", "transcript_path", "transcriptPath", "source"):
@@ -141,11 +153,46 @@ def hook(engine, args):
     if "workspacePaths" in payload and (not isinstance(payload["workspacePaths"], list)
             or any(not isinstance(path, str) for path in payload["workspacePaths"])):
         raise SyncError("hook workspacePaths must be an array of strings")
-    adapter = engine.adapters.get(args.harness)
+    return payload
+
+
+def hook_project(engine, adapter, sid, workspace, event):
+    """(project to sync, session key) for a hook of session sid reported at workspace.
+
+    At session start the reported directory is where the session was launched, so it is
+    recorded and synced. Later a harness reports its current directory, which follows `cd`
+    (Claude's Bash tool), so the workspace already recorded for the session wins.
+    """
+    key = "{}:{}:{}".format(adapter.installation.harness, adapter.installation.profile, sid)
+    if event == "start":
+        engine.store.notify_workspace(adapter.endpoint, sid, workspace)
+        return workspace, key
+    known = engine.store.last_workspace(key)
+    # Before the session is first parsed, the workspace its start hook recorded still counts.
+    own = (known[2] if known and known[2] else "") or engine.store.workspace(adapter.endpoint, sid)
+    if not own:
+        engine.store.notify_workspace(adapter.endpoint, sid, workspace)
+    return own or workspace, key
+
+
+def request_sync(engine, args, project, adapter, sid):
+    """Sync after a hook: inline (tests, --inline, --dry-run) or as a request for a detached sync."""
+    if getattr(args, "inline", True) or getattr(args, "dry_run", False):
+        engine.sync(project=project, fresh=["{}:{}:{}".format(adapter.installation.harness, adapter.installation.profile, sid)] if sid else None)
+    else:
+        engine.deferred = {"project": project, "hook": [adapter.endpoint, sid or "", args.event]}
+
+
+def hook_target(adapters, args, payload):
+    """(adapter, workspace, session id, transcript) a hook acts for, or None when it has nothing to do.
+
+    Needs no lock or index: only the adapters, their settings paths and the payload.
+    """
+    adapter = adapters.get(args.harness)
     if adapter is None:
-        return {}
+        return None
     transcript = payload.get("transcript_path") or payload.get("transcriptPath")
-    shared = [a for a in engine.adapters.values() if a.installation.harness == adapter.installation.harness
+    shared = [a for a in adapters.values() if a.installation.harness == adapter.installation.harness
               and settings_path(a).resolve() == settings_path(adapter).resolve()]
     if len(shared) > 1:
         matching = []
@@ -161,47 +208,81 @@ def hook(engine, args):
             matching = [a for a in matching if len(str(a.home.resolve())) == longest]
         if len(matching) != 1:
             print("agent-session-sync: shared hook cannot identify the active profile; use separate profile settings or `open harness@profile`", file=sys.stderr)
-            return {}
+            return None
         adapter = matching[0]
-    endpoint = adapter.endpoint
     if adapter.installation.harness == "agy" and transcript:
         # Antigravity shares its global hook file with desktop/IDE surfaces.
         try:
             Path(transcript).expanduser().resolve().relative_to(adapter.home.expanduser().resolve())
         except ValueError:
-            return {}
+            return None
     workspace = payload.get("cwd") or next(iter(payload.get("workspacePaths", [])), "")
-    sid = payload.get("session_id") or payload.get("sessionId") or payload.get("conversationId")
     if not workspace:
-        return {}
+        return None
+    sid = payload.get("session_id") or payload.get("sessionId") or payload.get("conversationId") or ""
     # Stored workspaces keep their spelling (launch cwd, Claude project names); only comparisons normcase.
-    workspace = resolved_workspace(workspace)
-    if sid:
-        engine.store.notify_workspace(endpoint, sid, workspace)
-    # Startup injection must not alter an explicit resume, fork, or compaction.
-    if args.event == "start" and payload.get("source") in ("resume", "compact", "fork", "clear", "new"):
-        return {}
-    if payload.get("agent_id") or payload.get("agentId"):
-        return {}
-    if args.event == "stop" or adapter.native_import or not engine.config.get("auto_handoff", True) or not adapter.options.get("auto_handoff", True):
-        # Native mirrors are available in their normal resume picker.
-        engine.sync(project=workspace)
-        return {}
+    return adapter, resolved_workspace(workspace), sid, transcript
+
+
+def hook_skips(args, payload):
+    """Startup injection must not alter an explicit resume, fork, or compaction; subagents are not sessions."""
+    return (args.event == "start" and payload.get("source") in ("resume", "compact", "fork", "clear", "new")) \
+        or bool(payload.get("agent_id") or payload.get("agentId"))
+
+
+def may_inject(config, adapter, args, payload):
+    """A start hook of a context harness with injection enabled (before reading its transcript)."""
+    return (args.event == "start" and not adapter.native_import and not hook_skips(args, payload)
+            and config.get("auto_handoff", True) and adapter.options.get("auto_handoff", True))
+
+
+def injects(config, adapter, args, payload, sid, transcript):
+    """may_inject, for a session that has no turns of its own yet."""
+    if not may_inject(config, adapter, args, payload):
+        return False
     if sid and transcript and Path(transcript).is_file():
         existing = adapter.read(SessionRef(sid, transcript))
         if any(e.kind in ("assistant", "tool_call", "tool_result") for e in existing.events) or sum(e.kind == "user" for e in existing.events) > 1:
-            engine.sync(project=workspace)
-            return {}
-    item = engine.incoming(endpoint, workspace, sid)
-    if not item:
-        engine.sync(project=workspace)
-        return {}
-    context = Path(item["context"]).read_text(encoding="utf-8-sig")
-    if sid:
-        engine.store.db.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)",
-                                ("binding:{}:{}".format(endpoint, sid), item["id"]))
+            return False
+    return True
+
+
+LAUNCH_SECONDS = 120
+
+
+def launched_transfer(engine, adapter, args, project, sid, transcript):
+    """The transfer an explicit open / handoff --launch started this session with, if any.
+
+    Recognized from the launch prompt when the harness has already recorded it, else from the
+    launch record `execute` leaves for the destination just before starting the harness
+    (consumed here, valid for LAUNCH_SECONDS, for the launch's workspace only).
+    """
+    if sid and transcript and Path(transcript).is_file():
+        try:
+            session = adapter.read(SessionRef(sid, transcript))
+        except (SyncError, OSError, ValueError):
+            session = None
+        if session is not None and session.provenance.get("context"):
+            transfer = engine.store.transfer(session.provenance.get("transfer_id", ""))
+            if Engine.launched(session, transfer):
+                return transfer["id"]
+    key = "launching:" + adapter.endpoint
+    row = engine.store.db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+    if not row:
+        return None
+    try:
+        launch, workspace, started = json.loads(row[0])
+        fresh = time.time() - float(started) < LAUNCH_SECONDS and workspace == normalized_workspace(project)
+    except (ValueError, TypeError, SyncError):
+        launch, fresh = None, False
+    if fresh:
+        engine.store.db.execute("DELETE FROM metadata WHERE key=?", (key,))
         engine.store.db.commit()
-    engine.sync(project=workspace)
+        return launch
+    return None
+
+
+def injection_output(adapter, context):
     name = adapter.installation.harness
     if name == "agy":
         return {"injectSteps": [{"userMessage": context}]}
@@ -210,25 +291,141 @@ def hook(engine, args):
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
 
 
+def hook(engine, args, target=None):
+    payload = hook_payload(args)
+    target = target or hook_target(engine.adapters, args, payload)
+    if target is None:
+        return {}
+    adapter, workspace, sid, transcript = target
+    project = hook_project(engine, adapter, sid, workspace, args.event)[0] if sid else workspace
+    if hook_skips(args, payload):
+        return {}
+    launch = launched_transfer(engine, adapter, args, project, sid, transcript) if may_inject(engine.config, adapter, args, payload) else None
+    if launch:
+        # An explicit open / handoff --launch already carries its context: inject nothing more,
+        # and bind the session to the launched transfer.
+        if sid:
+            engine.store.db.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)", ("binding:{}:{}".format(adapter.endpoint, sid), launch))
+            engine.store.db.commit()
+        request_sync(engine, args, project, adapter, sid)
+        return {}
+    if not injects(engine.config, adapter, args, payload, sid, transcript):
+        # Native mirrors are available in their normal resume picker.
+        request_sync(engine, args, project, adapter, sid)
+        return {}
+    item = engine.incoming(adapter.endpoint, project, sid)
+    if not item:
+        request_sync(engine, args, project, adapter, sid)
+        return {}
+    context = Path(item["context"]).read_text(encoding="utf-8-sig")
+    if sid:
+        engine.store.db.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)",
+                                ("binding:{}:{}".format(adapter.endpoint, sid), item["id"]))
+        engine.store.db.commit()
+    request_sync(engine, args, project, adapter, sid)
+    return injection_output(adapter, context)
+
+
+def codex_delete(adapters):
+    """A prune deleter that removes a superseded Codex import with `codex delete`, which also
+    drops it from Codex's own thread index. It needs no credentials or network.
+
+    `codex delete` acts on a thread id across the whole Codex home, so it runs only when the
+    file prune checked is the only rollout of that id (none resumed elsewhere or archived)
+    and Codex's index shows no turn or archive beyond the import's own.
+    """
+    def delete(destination, native_id, path, check=False):
+        adapter = adapters.get(destination)
+        if adapter is None or adapter.installation.harness != "codex" or not adapter.installation.executable:
+            return False
+        home = adapter.home.expanduser().resolve()
+        try:
+            target = Path(path).resolve()
+            target.relative_to((home / "sessions").resolve())
+            # Compressed (.jsonl.zst) copies are the same thread: Codex compresses cold rollouts.
+            copies = {p.resolve() for p in (home / "sessions").glob("**/rollout-*" + native_id + ".jsonl*")}
+            copies |= {p.resolve() for p in (home / "archived_sessions").glob("**/*" + native_id + ".jsonl*")}
+        except (OSError, ValueError, RuntimeError):
+            return False
+        # Exactly one copy: a plain file beside its .zst twin may differ from it (a continuation).
+        if len(copies) != 1 or not copies <= {target, Path(str(target) + ".zst")} or codex_thread_used(home, native_id, target):
+            return False
+        if check:
+            return True  # a dry run asks only whether the copy could go
+        try:
+            result = subprocess.run([adapter.installation.executable, "delete", "--force", native_id],
+                                    env=dict(os.environ, CODEX_HOME=str(home)), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+    return delete
+
+
+def codex_thread_used(home, native_id, target):
+    """Whether Codex shows the thread was used beyond the import: renamed (session_index.jsonl
+    or a name), archived, pinned, filed into a section or project, pointing at another rollout,
+    or holding more than the import's single turn.
+
+    Anything missing or unreadable counts as used, so an unknown layout never allows a delete.
+    """
+    def newest(pattern):
+        found = sorted(home.glob(pattern), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
+        return found[-1] if found else None
+    state, history = newest("state_*.sqlite"), newest("thread_history_*.sqlite")
+    if state is None:
+        return True
+    try:
+        names = home / "session_index.jsonl"
+        if names.exists():
+            with names.open("rb") as stream:
+                for line in stream:
+                    try:
+                        if json.loads(line).get("id") == native_id:
+                            return True
+                    except (ValueError, AttributeError):
+                        return True
+        with contextlib.closing(sqlite3.connect(state.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM threads WHERE id=?", (native_id,)).fetchone()
+        if row is not None:
+            row = dict(row)
+            if row.get("rollout_path") and Path(row["rollout_path"]).resolve() not in (target, Path(str(target) + ".zst")):
+                return True
+            if any(row.get(field) for field in ("archived", "name", "is_pinned", "thread_section_id", "project_id")):
+                return True
+        if history is not None:
+            with contextlib.closing(sqlite3.connect(history.absolute().as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+                turns = db.execute("SELECT count(*) FROM thread_turns WHERE thread_id=?", (native_id,)).fetchone()[0]
+            if turns > 1:
+                return True
+    except (sqlite3.Error, OSError, ValueError):
+        return True
+    return False
+
+
 def auto_prune(engine, directory, config, args):
     """Daily retention after a scheduled sync. A failure is reported but never fails the sync."""
     days = retention_from(config)
     if args.dry_run or days is None or not prune_due(engine.store):
         return
     try:
-        report = prune(engine.store, directory, days)
+        report = prune(engine.store, directory, days, native=native_from(config), delete=codex_delete(engine.adapters))
         mark_pruned(engine.store)
     except (OSError, ValueError, sqlite3.Error) as exc:
         print("agent-session-sync: prune skipped: {}".format(exc), file=sys.stderr)
         return
     if args.verbose and not args.json:
-        print("pruned {} handoff folder(s), {} archive snapshot(s), {} image blob(s), {:.1f} MB".format(
-            report["handoffs_removed"], report["archives_removed"], report["blobs_removed"], report["bytes_freed"] / 1e6), file=sys.stderr)
+        print("pruned {} handoff folder(s), {} archive snapshot(s), {} image blob(s), {} superseded import(s), {:.1f} MB".format(
+            report["handoffs_removed"], report["archives_removed"], report["blobs_removed"],
+            report["native_copies_removed"], report["bytes_freed"] / 1e6), file=sys.stderr)
 
 
 def execute(args):
     config = load_config(args.config)
-    directory = Path(args.state_dir).expanduser().absolute() if args.state_dir else state_dir()
+    # Absolute, so a detached sync started in the state directory finds the same one.
+    directory = (Path(args.state_dir).expanduser() if args.state_dir else state_dir()).absolute()
     if args.command == "update":
         return update(args)
     installations = discover(config, args.refresh, args.dry_run, directory)
@@ -244,15 +441,216 @@ def execute(args):
     if args.command in ("install", "uninstall"):
         changes = setup(adapters, directory, config, args.config, args.command == "uninstall", args.dry_run,
                         args.no_cron, args.no_hooks, args.memories, args.purge)
+        if not args.dry_run and not (args.command == "uninstall" and args.purge):
+            hand_on_pending(args, directory)
         emit({"dry_run": args.dry_run, "changes": changes} if args.json else changes or ("Nothing to remove." if args.command == "uninstall" else "Automation already configured."), args)
         return 0
+    if args.command == "hook":
+        return run_hook(args, adapters, config, directory)
+    queued = args.command == "sync" and args.queued and not args.dry_run
+    try:
+        status, pending_launch = run_locked(args, adapters, config, directory, QUEUED_LOCK_WAIT if queued else 0)
+    except Busy:
+        if not queued:
+            raise
+        # Queue the request, then try once more: the holder may have released the lock
+        # (and checked the queue) while this process was still waiting.
+        if args.project or args.for_hook:
+            add_pending(directory, {"project": args.project, "hook": args.for_hook})
+        return drain_after_release(args, adapters, config, directory)
+    except Exception:
+        # This process held the lock and failed: requests queued meanwhile go to a detached sync.
+        if not args.dry_run:
+            hand_on_pending(args, directory)
+        raise
+    if not args.dry_run:
+        if args.command == "sync":
+            status = max(status, drain_after_release(args, adapters, config, directory))
+        else:
+            # Requests queued while this command held the lock; a detached sync takes them.
+            hand_on_pending(args, directory)
+    if pending_launch:
+        # Ctrl-C belongs to the interactive harness. A no-op handler (unlike SIG_IGN)
+        # is reset to the default in the child on exec.
+        previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
+        try:
+            return subprocess.call(pending_launch[0], cwd=pending_launch[1])
+        finally:
+            signal.signal(signal.SIGINT, previous)
+    return status
+
+
+# A hook answers its harness quickly: it waits this long for the lock, then hands its sync on.
+HOOK_LOCK_WAIT = 1
+# A start hook that may inject context waits longer, since a missed lock means no injection.
+INJECTION_LOCK_WAIT = 10
+QUEUED_LOCK_WAIT = 2
+
+
+def run_hook(args, adapters, config, directory):
+    """Answer a lifecycle hook: inject context when due; the sync itself runs detached."""
+    args.payload = hook_payload(args)
+    target = hook_target(adapters, args, args.payload)
+    if target is None:
+        write_output(json.dumps({}))
+        return 0
+    if args.inline or args.dry_run:
+        with single_flight(directory, args.dry_run):
+            engine = Engine(adapters, directory, args.dry_run, config)
+            try:
+                write_output(json.dumps(hook(engine, args, target), ensure_ascii=False))
+            finally:
+                engine.close()
+        return 0
+    adapter, workspace, sid, transcript = target
+    injecting = may_inject(config, adapter, args, args.payload)
+    output, request, held = {}, None, False
+    fallback = None if hook_skips(args, args.payload) else {"project": workspace, "hook": [adapter.endpoint, sid, args.event]}
+    try:
+        with single_flight(directory, wait=INJECTION_LOCK_WAIT if injecting else HOOK_LOCK_WAIT):
+            held, engine = True, None
+            try:
+                engine = Engine(adapters, directory, False, config)
+                output = hook(engine, args, target)
+                request = engine.deferred
+            except Exception as exc:
+                # Fail open, but the session still gets its sync and the queue is still handed on.
+                print("agent-session-sync hook: {}".format(exc), file=sys.stderr)
+                output, request = {}, fallback
+            finally:
+                if engine is not None:
+                    engine.close()
+    except Busy:
+        # A sync is running: hand it this hook's sync. Nothing is injected without the lock,
+        # because only the index can say whether the injection is still due (see incoming).
+        request = fallback
+    write_output(json.dumps(output, ensure_ascii=False))
+    # Nothing may fail after the answer is written: the harness reads exactly one JSON object.
+    if request:
+        try:
+            spawn_sync(args, directory, request)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print("agent-session-sync hook: detached sync not started: {}".format(exc), file=sys.stderr)
+            try:
+                add_pending(directory, request)
+            except OSError:
+                pass
+    elif held:
+        hand_on_pending(args, directory)
+    return 0
+
+
+def hand_on_pending(args, directory):
+    """After holding the lock without syncing, hand queued requests to a drain-only sync."""
+    try:
+        if has_pending(directory):
+            spawn_sync(args, directory, {})
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+
+def spawn_sync(args, directory, request):
+    """Start `sync` for a hook's request in a detached process that outlives the hook.
+
+    An empty request only takes the queued requests (see run_locked).
+    """
+    command = entry_command() + ["--state-dir", str(directory)]
+    config = args.config or os.environ.get("AGENT_SESSION_SYNC_CONFIG")
+    if config:
+        command += ["--config", str(Path(config).expanduser().absolute())]
+    command += ["sync", "--quiet", "--queued"]
+    if request.get("project"):
+        command += ["--project", request["project"]]
+    if request.get("hook"):
+        command += ["--for-hook"] + list(request["hook"])
+    # The hook runs in the user's project; `python -m` would import a same-named package from it.
+    options = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True,
+               "cwd": str(directory)}
+    if os.name == "nt":
+        # A hidden console of its own, which console programs the sync starts inherit.
+        options["creationflags"] = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    else:
+        options["start_new_session"] = True
+    log = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        log = open(str(directory / "sync.log"), "ab")
+        options["stderr"] = log
+    except OSError:
+        pass
+    try:
+        # No pipe of the hook's is inherited, so the harness never waits for this process.
+        subprocess.Popen(command, **options)
+    finally:
+        if log is not None:
+            log.close()
+
+
+def resolve_request(engine, request):
+    """(project, fresh session keys) for a queued or deferred sync request; (None, None)
+    for one that names nothing, which is ignored rather than run as a full sync."""
+    project = request.get("project") or None
+    hook_info = request.get("hook")
+    if project and isinstance(hook_info, list) and len(hook_info) == 3 and all(isinstance(x, str) for x in hook_info):
+        endpoint, sid, event = hook_info
+        adapter = engine.adapters.get(endpoint)
+        if adapter is not None and sid:
+            project, key = hook_project(engine, adapter, sid, project, event)
+            return project, [key]
+    return project, None
+
+
+def drain_pending(engine, directory, args):
+    """Run the sync requests queued while this process held the lock."""
+    results = []
+    for _ in range(3):
+        try:
+            requests = take_pending(directory)
+        except OSError as exc:
+            engine.errors.append("queued syncs: {}".format(exc))
+            break
+        if not requests:
+            break
+        for request in requests:
+            try:
+                project, fresh = resolve_request(engine, request)
+                if project is None:
+                    continue
+                # The default budget, as the hook's own detached sync would use: not the drainer's.
+                results += engine.sync(project=project, fresh=fresh)
+            except (OSError, SyncError, ValueError, sqlite3.Error) as exc:
+                engine.errors.append("queued sync {}: {}".format(request.get("project"), exc))
+    return results
+
+
+def drain_after_release(args, adapters, config, directory):
+    """Requests queued after the last drain but before the lock was released."""
+    status = 0
+    for _ in range(3):
+        if not has_pending(directory):
+            break
+        try:
+            with single_flight(directory):
+                engine = Engine(adapters, directory, False, config)
+                try:
+                    drain_pending(engine, directory, args)
+                    for error in engine.errors:
+                        print("agent-session-sync: " + error, file=sys.stderr)
+                    status = max(status, 1 if engine.errors else 0)
+                finally:
+                    engine.close()
+        except Busy:
+            break  # the new holder takes them
+    else:
+        hand_on_pending(args, directory)  # still more after three rounds: a detached sync continues
+    return status
+
+
+def run_locked(args, adapters, config, directory, wait=0):
     pending_launch = None
-    with single_flight(directory, args.dry_run):
+    with single_flight(directory, args.dry_run, wait):
         engine = Engine(adapters, directory, args.dry_run, config)
         try:
-            if args.command == "hook":
-                write_output(json.dumps(hook(engine, args), ensure_ascii=False))
-                return 0
             if args.command == "list":
                 sessions = engine.scan(args.project, args.harness, args.days)
                 emit([s.to_dict() for s in sessions] if args.json else ["{}  {}  [{}]".format(s.key, s.title, s.workspace or "workspace unknown") for s in sessions], args)
@@ -299,11 +697,11 @@ def execute(args):
                     raise SyncError("unknown destination: " + destination)
                 if args.command == "handoff":
                     session = engine.select(args.session, args.project)
-                    item = engine.handoff(session, destination, mode=args.mode, budget=args.budget, note=args.note)
+                    item = engine.handoff(session, destination, mode=args.mode, budget=args.budget, note=args.note, explicit=True)
                 else:
                     sessions = engine.scan(project=args.project)
                     session = next((s for s in sessions if s.endpoint != destination), None)
-                    item = engine.handoff(session, destination, budget=args.budget) if session else {
+                    item = engine.handoff(session, destination, budget=args.budget, explicit=True) if session else {
                         "command": [adapters[destination].installation.executable or destination], "workspace": resolved_workspace(args.project)}
                 emit(item if args.json else ("Would prepare " if args.dry_run else "Prepared ") + destination + ":\n" + shell_command(item["command"]), args)
                 launch = args.command == "open" or args.launch
@@ -312,6 +710,11 @@ def execute(args):
                         raise SyncError("destination executable is not installed: " + destination)
                     # The harness runs after the lock is released so its own hooks can sync.
                     pending_launch = (item["command"], item["workspace"] or None)
+                    if item.get("id") and item.get("workspace"):
+                        # Its start hook must not inject another conversation (see launched_transfer).
+                        engine.store.db.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?)", ("launching:" + destination,
+                                                json.dumps([item["id"], normalized_workspace(item["workspace"]), time.time()])))
+                        engine.store.db.commit()
             elif args.command == "sync":
                 if args.to_claude and args.to_codex:
                     raise SyncError("choose only one of --to-claude and --to-codex")
@@ -322,9 +725,16 @@ def execute(args):
                     if source and source not in (session.harness, session.endpoint):
                         raise SyncError("session does not belong to selected source")
                     targets = [destination] if destination else [name for name, a in adapters.items() if a.installation.executable and name != session.endpoint]
-                    results = [engine.handoff(session, target, budget=args.budget) for target in targets]
+                    results = [engine.handoff(session, target, budget=args.budget, explicit=True) for target in targets]
                 else:
-                    results = engine.sync(source, destination, args.project, args.days, args.budget)
+                    # A hook's request names its session: sync that session's own workspace.
+                    project, fresh = resolve_request(engine, {"project": args.project, "hook": args.for_hook}) \
+                        if args.for_hook else (args.project, None)
+                    # A queued sync with no project of its own only takes the queue.
+                    drain_only = args.queued and not args.project and not args.for_hook
+                    results = [] if drain_only else engine.sync(source, destination, project, args.days, args.budget, fresh=fresh)
+                    if not args.dry_run:
+                        results += drain_pending(engine, directory, args)
                 emit({"transfers": results, "errors": engine.errors, "dry_run": args.dry_run} if args.json else
                      "{}{} handoff(s) across detected harnesses{}".format("Would prepare " if args.dry_run else "Prepared ", len(results), " ({} errors)".format(len(engine.errors)) if engine.errors else ""), args)
                 if args.verbose and not args.json:
@@ -333,12 +743,16 @@ def execute(args):
                 auto_prune(engine, directory, config, args)
             elif args.command == "prune":
                 days = args.keep_days if args.keep_days is not None else (retention_from(config) or DEFAULT_RETENTION_DAYS)
-                report = prune(engine.store, directory, days, args.dry_run)
+                report = prune(engine.store, directory, days, args.dry_run, native=native_from(config),
+                               delete=codex_delete(engine.adapters))
                 if not args.dry_run:
                     mark_pruned(engine.store)
-                text = "{}{} handoff folder(s), {} archive snapshot(s) and {} image blob(s), {:.1f} MB (kept {} live transfers, retention {} days)".format(
+                text = ("{}{} handoff folder(s), {} archive snapshot(s), {} image blob(s), {} superseded import(s), "
+                        "{} plain duplicate(s) of compressed Codex imports and {} index row(s) of deleted transcripts, "
+                        "{:.1f} MB (kept {} live transfers, retention {} days)").format(
                     "Would remove " if args.dry_run else "Removed ", report["handoffs_removed"], report["archives_removed"],
-                    report["blobs_removed"], report["bytes_freed"] / 1e6, report["kept_transfers"], days)
+                    report["blobs_removed"], report["native_copies_removed"], report["compressed_duplicates_removed"],
+                    report["index_rows_forgotten"], report["bytes_freed"] / 1e6, report["kept_transfers"], days)
                 if args.compact_store:
                     # Runs under the sync lock taken above, so no scheduled sync writes meanwhile.
                     report.update(compact_archives(directory, args.dry_run))
@@ -355,15 +769,7 @@ def execute(args):
             status = 1 if engine.errors else 0
         finally:
             engine.close()
-    if pending_launch:
-        # Ctrl-C belongs to the interactive harness. A no-op handler (unlike SIG_IGN)
-        # is reset to the default in the child on exec.
-        previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
-        try:
-            return subprocess.call(pending_launch[0], cwd=pending_launch[1])
-        finally:
-            signal.signal(signal.SIGINT, previous)
-    return status
+    return status, pending_launch
 
 
 def update(args):

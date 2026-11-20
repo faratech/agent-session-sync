@@ -50,6 +50,16 @@ Windows) and hooks for detected Claude, Muse, Antigravity, and Copilot
 installations. Start a new harness session to load its hooks. Codex history is
 picked up by the scheduler and by the other harnesses' hooks.
 
+Hooks answer their harness at once. Only a start hook that injects context (see
+below) does work while the harness waits. It reuses a handoff that is already
+complete. If another sync holds the lock for more than ten seconds, it injects
+nothing: only the index can say whether an injection is still due. Every other
+sync runs in a detached `sync` process. When a sync is already running, the request is queued as a file in
+`pending/`, and the process holding the lock takes it before releasing the lock.
+Each hook syncs the workspace recorded for its own session, even after the agent
+has `cd`'d into a subdirectory. Because those detached syncs also prune, retention
+works on machines without a scheduler.
+
 No per-switch handoff command is required:
 
 | Harness | Incoming conversations |
@@ -60,7 +70,14 @@ No per-switch handoff command is required:
 | Antigravity (`agy`) | Latest foreign conversation for the workspace injected by a new-session hook |
 | GitHub Copilot CLI (`copilot`) | Latest foreign conversation for the project injected by a new-session hook |
 
-Context hooks leave explicit resumes and existing conversations alone. They
+Only a conversation active within the last `auto_handoff_max_age_hours` (default
+2; `null` removes the limit) is injected. An older one is usually unrelated to the
+task a new session starts. A session that started with injected context is
+exported with its own turns and title, and records the injected conversation as
+its parent instead of merging that history in front of its own. An explicit
+`open` or `handoff --launch` continues the source as before, and its start hook
+injects nothing more. A title you give a continued import yourself is kept. Context hooks leave
+explicit resumes and existing conversations alone. They
 don't call a model or change permissions. Selection stays within the same
 workspace; a newer conversation in the target harness takes precedence over an
 older foreign one. You can also open a harness with the latest foreign context:
@@ -155,8 +172,10 @@ new artifacts while preserving older snapshots.
 Sources are read-only. A → B → A creates a new linked conversation; earlier
 sessions remain available. Unchanged imports aren't imported again, while
 continuations are combined with their archived parents. Native handoffs are
-snapshots: a changed source revision can create another imported session.
-Earlier snapshots aren't automatically deleted.
+snapshots: a changed source revision creates another imported session. Prune
+removes the superseded ones nobody resumed (see [Retention](#retention)). An
+imported session's first prompt starts with the conversation's title and source
+harness, so resume pickers tell imports apart.
 
 Writes are atomic and deterministic, and sync runs share a lock. Continued or
 unfamiliar destinations are never overwritten, and a native history that already
@@ -237,7 +256,16 @@ before migration. Registered legacy files and IDs remain intact; new native
 handoffs use independent snapshots, so a live legacy continuation is never
 replaced during migration. Keep archives and the ledger together to preserve
 lineage. Project-scoped scans use workspace hints to avoid decoding unrelated
-cached histories; completed transfers repair missing generated artifacts.
+cached histories, including transcripts that have only grown since they were last
+parsed; completed transfers repair missing generated artifacts. A transcript that
+grows while it is read is read up to its size at open, since JSONL histories are
+append-only.
+
+A transcript of 32 MB or more that changed in the last two minutes is still being
+written. Its full document isn't cached, because it would be stale within seconds.
+Such a session is also snapshotted at most once per `hot_handoff_minutes` (default
+30; `null` removes the limit), unless its own hook asked for the sync. This is
+because each snapshot of a long session writes a complete archive.
 
 ### Archive format
 
@@ -271,8 +299,8 @@ the file given. The `.md` transcripts are unchanged.
 
 Each time a conversation changes, sync writes a complete new archive snapshot and
 one handoff folder per destination. Older copies are pruned automatically, at
-most once an hour, after a scheduled sync. Only files nothing can use are
-removed. These are always kept:
+most once an hour, after a scheduled or hook-triggered sync. Only files nothing
+can use are removed. These are always kept:
 
 - the newest transfer of every source/destination route;
 - any transfer a conversation was continued from (its continuation is rebuilt
@@ -300,6 +328,45 @@ version 2 (checking that each restores the same session, and keeping its
 modification time), compresses large index rows, and runs `VACUUM`. New archives
 and rows are written compactly without it. Image blobs no archive references are
 removed by prune once they are an hour old.
+
+Prune also removes superseded native imports from Claude and Codex history, so a
+resume picker keeps one copy of each conversation. A copy is removed only when all
+of these hold:
+
+- a newer import of a later revision of the same conversation went to the same
+  destination and finished;
+- its bytes are exactly what sync wrote (it was never resumed or continued);
+- it is over an hour old.
+
+A handoff you ask for yourself (`handoff`, `open`, `sync --session`) is kept until
+it leaves the retention window, along with its note. Handoffs made before 2.2.0
+carry no such mark. Any import of the same revision as the newest one also stays,
+including one an earlier release rendered.
+
+Claude copies are deleted. Codex copies are removed with `codex delete --force`,
+which also drops them from Codex's own thread index. Because that command acts on
+the whole thread, it runs only in these conditions:
+
+- the copy is the only rollout of its id, with none resumed elsewhere or archived;
+- Codex's index shows nothing beyond the import's own turn, and the thread was not
+  renamed, pinned, archived or filed into a section or project;
+- the Codex executable is available.
+
+With no Codex index to check, nothing is deleted.
+
+Set `prune_native_copies` to `false` to keep every copy, or to a list such as
+`["claude"]` to limit it to some destinations. Prune also drops index entries for
+transcripts that were deleted. They are a cache and are rebuilt if a file comes
+back. It keeps entries that hold a continued import's lineage, and entries whose
+directory is gone (an unmounted or moved home).
+
+Codex compresses cold rollouts into `rollout-*.jsonl.zst`. These are read with
+Python 3.14's `compression.zstd`, the `zstandard` package, or the `zstd` command.
+Without any of these, compressed rollouts are skipped. An import you archive in
+Codex counts as present and is not written back.
+A compressed import counts as present, so it is never written again. Earlier
+releases did write some back beside the compressed copy. Prune removes such a plain
+copy while it still holds exactly what sync wrote; the compressed file always stays.
 
 Sync also stops writing new handoffs when the state directory's disk has less
 than `min_free_gb` free (default 5; `0` turns the check off). It reports a
