@@ -76,6 +76,29 @@ class AtomicWriteTests(unittest.TestCase):
 
 
 class NativeTargetTests(Workspace):
+    def test_repair_streams_the_hash_of_a_resumed_native_target(self):
+        engine = self.engine()
+        first, = engine.sync(source="muse", destination="codex", days=None)
+        target = Path(first["target"])
+        with target.open("ab") as stream:
+            stream.write(b'{"type":"event_msg","payload":{"type":"user_message","message":"more"}}\n')
+        continued = target.read_bytes()
+        context = Path(first["context"])
+        context.unlink()
+        read_bytes = Path.read_bytes
+
+        def refuse_target_read(path):
+            if path == target:
+                raise AssertionError("native target was read into memory")
+            return read_bytes(path)
+
+        with mock.patch.object(Path, "read_bytes", refuse_target_read):
+            repaired, = engine.sync(source="muse", destination="codex", days=None)
+        self.assertEqual(repaired["id"], first["id"])
+        self.assertTrue(repaired["continued"])
+        self.assertTrue(context.is_file())
+        self.assertEqual(target.read_bytes(), continued)
+
     def test_existing_native_history_is_never_rewritten(self):
         # Issue #105: no check-then-replace of a file a harness may be continuing.
         self.addCleanup(setattr, legacy, "_codex_version", None)

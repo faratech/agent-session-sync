@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 from .blobs import BLOB_DIR, references_from_file
-from .io import SyncError, zstd_content_size, zstd_decompress
+from .io import SyncError, frame_content_size, read_zstd, zstd_decompress
 from .store import lineage_summary, load_document
 
 DEFAULT_RETENTION_DAYS = 3
@@ -266,10 +266,15 @@ def unchanged(stored, item):
         # provenance and adding items) without new turns: compared by parse as a .zst is.
         content = Path(stored).read_bytes()
     else:
-        declared = zstd_content_size(stored)
-        if declared is not None and declared > bound:
+        try:
+            with Path(stored).open("rb", buffering=0) as stream:
+                declared = frame_content_size(stream.read(18))
+                if declared is not None and declared > bound:
+                    return False
+                stream.seek(0)
+                content = read_zstd(stored, stream, bound, require_complete=True)
+        except (OSError, SyncError):
             return False
-        content = zstd_decompress(stored, Path(stored).read_bytes())
         if hashlib.sha256(content).hexdigest() == item["target_sha"]:
             return True
     if not item.get("baseline_sha"):

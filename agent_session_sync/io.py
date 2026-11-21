@@ -341,8 +341,8 @@ def transcript_too_large(path, limit):
     return SyncError("transcript exceeds the {:g} MiB read limit: {}".format(limit / (1 << 20), path))
 
 
-def read_zstd(path, stream, limit):
-    """Decode at most limit bytes, including across frames with no declared size."""
+def read_zstd(path, stream, limit, *, require_complete=False):
+    """Decode up to limit bytes. Cleanup requires a decoder that can check every frame."""
     try:
         from compression import zstd
     except ImportError:
@@ -371,6 +371,8 @@ def read_zstd(path, stream, limit):
         decompressor = zstandard.ZstdDecompressor()
         decoder = decompressor.decompressobj()
         if not hasattr(decoder, "eof"):
+            if require_complete:
+                raise SyncError("cannot verify all zstd frames in {} with this decoder".format(path))
             # Older releases could only report one frame. Keep that behavior
             # using their bounded streaming interface.
             for chunk in decompressor.read_to_iter(stream):

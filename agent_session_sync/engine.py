@@ -703,12 +703,12 @@ class Engine:
                     item = dict(item, target_sha=previous["target_sha"])
                 continue
             if target and Path(path).exists():
-                current = digest(Path(path).read_bytes())
+                current = file_sha(path)
                 if previous and previous.get("state") == "complete" and current != previous["target_sha"]:
                     # A resumed import must remain resumable; its continuation is ingested separately.
                     continued = True
                     continue
-                if current == digest(data) or previous and current == previous.get("target_sha"):
+                if current == item["target_sha"] or previous and current == previous.get("target_sha"):
                     # An existing native history is never rewritten: a harness can continue it at any
                     # moment, and no check-then-replace is atomic against that. The copy from an
                     # earlier or interrupted attempt of this transfer is kept as it is, even when

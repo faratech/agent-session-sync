@@ -309,8 +309,28 @@ class CompressedSupersededImports(Workspace):
         compressed = compress(first["target"])
         settle(Path(first["context"]).with_name("manifest.json"), hours=3)
         settle(compressed, second["target"])
-        with mock.patch.object(prune_module, "zstd_decompress", side_effect=AssertionError("decompressed")):
+        with mock.patch.object(prune_module, "read_zstd", side_effect=AssertionError("decompressed")):
             self.assertEqual(prune(engine.store, self.state, 7, delete=self.deleter(compressed))["native_copies_removed"], 0)
+
+    def test_prune_keeps_oversized_or_truncated_later_frames(self):
+        engine = self.engine()
+        first, second = self.two(engine)
+        compressed = compress(first["target"])
+        valid = compressed.read_bytes()
+        bound = 4 * first["target_size"] + (1 << 20)
+        tail = zstd_compress(b"\n")
+        compressed.write_bytes(valid + tail)
+        self.assertTrue(prune_module.unchanged(compressed, first))
+        delete = mock.Mock(return_value=True)
+        for name, later_frame in (("oversized", zstd_compress(b"\n" * bound)), ("truncated", tail[:-1])):
+            with self.subTest(frame=name):
+                compressed.write_bytes(valid + later_frame)
+                settle(compressed, second["target"])
+                with mock.patch.object(prune_module, "read_zstd", wraps=io_module.read_zstd) as reader:
+                    self.assertEqual(prune(engine.store, self.state, 7, delete=delete)["native_copies_removed"], 0)
+                    reader.assert_called_once()
+                delete.assert_not_called()
+                self.assertTrue(compressed.is_file())
 
 
 class RetentionDetails(Workspace):
