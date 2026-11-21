@@ -105,6 +105,32 @@ class ArchiveTests(unittest.TestCase):
             self.assertTrue(installer.vet(Path(directory) / "tree"))
 
 
+@unittest.skipUnless(os.name == "nt", "requires Windows ACLs")
+class WindowsInheritanceTests(unittest.TestCase):
+    def test_install_and_update_inherit_prefix_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "install"
+            prefix.mkdir()
+            subprocess.run(["icacls", str(prefix), "/grant", "*S-1-1-0:(OI)(CI)(RX)"],
+                           check=True, capture_output=True)
+            for _ in range(2):
+                result = subprocess.run([sys.executable, str(ROOT / "install.py"), "--source", str(ROOT),
+                                         "--prefix", str(prefix), "--managed", "--no-automation"],
+                                        capture_output=True, text=True, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                for relative in ("current", "current/agent-session-sync.py", "current/agent_session_sync/cli.py"):
+                    path = prefix / relative
+                    script = ("$a=Get-Acl -LiteralPath $env:ACL_TEST_PATH; "
+                              "$r=$a.Access | Where-Object { $_.IsInherited -and "
+                              "$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq 'S-1-1-0' }; "
+                              "if (-not $r) { exit 1 }")
+                    env = dict(os.environ, ACL_TEST_PATH=str(path))
+                    env["PSModulePath"] = str(Path(os.environ["WINDIR"]) / "System32/WindowsPowerShell/v1.0/Modules")
+                    check = subprocess.run(["powershell.exe", "-NoProfile", "-Command", script],
+                                           env=env, capture_output=True, text=True)
+                    self.assertEqual(check.returncode, 0, str(path) + check.stdout + check.stderr)
+
+
 @unittest.skipIf(os.name == "nt", "exercises cron and POSIX launchers")
 class UpdateInPlaceTests(unittest.TestCase):
     def setUp(self):

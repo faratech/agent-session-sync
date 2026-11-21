@@ -29,6 +29,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 REPO = "faratech/agent-session-sync"
@@ -326,6 +327,22 @@ def automation_command(entry, found, dry_run):
     return command
 
 
+def create_staging(prefix):
+    """Create a private POSIX stage or a Windows stage inheriting the prefix ACL."""
+    if not WINDOWS:
+        return Path(tempfile.mkdtemp(prefix=".staging-", dir=str(prefix)))
+    # Python 3.15 mkdtemp creates a protected owner-only DACL on Windows.
+    # A normal directory inherits the install prefix permissions needed by hooks.
+    for _ in range(10):
+        path = prefix / (".staging-" + uuid.uuid4().hex)
+        try:
+            path.mkdir()
+            return path
+        except FileExistsError:
+            continue
+    raise FileExistsError("could not create a unique staging directory")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Install or update agent-session-sync and its existing automation.")
     parser.add_argument("--ref", default=None, help="branch, tag, or commit to install (default: main)")
@@ -344,7 +361,7 @@ def main(argv=None):
         args.source = str(here)
     prefix = Path(args.prefix).expanduser() if args.prefix else data_home()
     prefix.mkdir(parents=True, exist_ok=True)
-    staged = Path(tempfile.mkdtemp(prefix=".staging-", dir=str(prefix)))
+    staged = create_staging(prefix)
     try:
         if args.source:
             say("source: " + str(Path(args.source).resolve()))
