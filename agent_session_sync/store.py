@@ -269,6 +269,15 @@ class Store:
                 key TEXT PRIMARY KEY, source_path TEXT, stat TEXT, workspace TEXT);
             CREATE TABLE IF NOT EXISTS revisions (key TEXT PRIMARY KEY, memo TEXT, revision TEXT);
             CREATE TABLE IF NOT EXISTS verified_archives (path TEXT PRIMARY KEY, signature TEXT);
+            CREATE TABLE IF NOT EXISTS sync_summaries (
+                key TEXT PRIMARY KEY, source_path TEXT NOT NULL, stat TEXT NOT NULL,
+                workspace TEXT NOT NULL, updated TEXT NOT NULL, revision TEXT NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS invalidate_sync_summary_on_insert AFTER INSERT ON sessions
+                BEGIN DELETE FROM sync_summaries WHERE key=NEW.key; END;
+            CREATE TRIGGER IF NOT EXISTS invalidate_sync_summary_on_update AFTER UPDATE ON sessions
+                BEGIN DELETE FROM sync_summaries WHERE key=OLD.key; END;
+            CREATE TRIGGER IF NOT EXISTS invalidate_sync_summary_on_delete AFTER DELETE ON sessions
+                BEGIN DELETE FROM sync_summaries WHERE key=OLD.key; END;
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(sessions)")}
         if "lineage" not in columns:
@@ -346,6 +355,21 @@ class Store:
             except ValueError:
                 pass
         return None
+
+    def sync_summary(self, key, path, stat, endpoint, native_id):
+        return self.db.execute("""
+            SELECT workspace, updated, revision FROM sync_summaries
+            WHERE key=? AND source_path=? AND stat=?
+            AND NOT EXISTS (SELECT 1 FROM metadata WHERE key=?)
+            """, (key, path, json.dumps(stat), "binding:{}:{}".format(endpoint, native_id))).fetchone()
+
+    def save_sync_summaries(self, rows):
+        with self.db:
+            self.db.executemany("INSERT OR REPLACE INTO sync_summaries VALUES (?, ?, ?, ?, ?, ?)", rows)
+
+    def forget_sync_summary(self, key):
+        with self.db:
+            self.db.execute("DELETE FROM sync_summaries WHERE key=?", (key,))
 
     def compressed_twin(self, key, path, stat):
         """The cached parse of the plain rollout Codex compressed into path (same mtime, same

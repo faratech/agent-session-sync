@@ -6,11 +6,11 @@ import os
 import re
 import shutil
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .adapters import PARSER_VERSION, SessionRef, WORKSPACE_UNKNOWN, choose_title
+from .adapters import BUILTINS, PARSER_VERSION, SessionRef, WORKSPACE_UNKNOWN, choose_title
 from .blobs import Blob, archive_bytes, blob_dir, internalize, read_archive, write_blob
 from .io import SyncError, atomic_write, digest, json_bytes, loads, normalized_workspace, resolved_workspace, SharedArtifact, atomic_share, zstd_available
 from .model import Session, Event, identity, markdown, instant
@@ -149,6 +149,17 @@ def free_bytes(directory):
         return float("inf")
 
 
+@dataclass(frozen=True)
+class SyncSummary:
+    key: str
+    endpoint: str
+    source_path: str
+    stamp: list
+    workspace: str
+    updated: str
+    revision: str
+
+
 class Engine:
     def __init__(self, adapters, directory, dry_run=False, config=None):
         self._delivered = {}
@@ -180,11 +191,15 @@ class Engine:
         return routes is None or any(r.get("from") == source and r.get("to") == destination
             and (not r.get("project") or normalized_workspace(r["project"]) == normalized_workspace(workspace)) for r in routes)
 
-    def scan(self, project=None, harness=None, days=30, force=False, selector=None, defer=None):
+    def scan(self, project=None, harness=None, days=30, force=False, selector=None, defer=None, _summary_sources=None):
         """Sessions in scope, newest first. defer=(interval, fresh keys) leaves out large
         sources still being written that sync handled within the interval (see sync);
-        they are listed in self.deferred_sources as (endpoint, workspace, updated)."""
+        they are listed in self.deferred_sources as (endpoint, workspace, updated).
+        Automatic sync accepts summaries of unchanged sessions. _summary_sources
+        records the path and stamp of full sessions eligible for a summary."""
         result = []
+        use_summaries = _summary_sources is not None
+        has_legacy_targets = use_summaries and self.store.db.execute("SELECT 1 FROM legacy_targets LIMIT 1").fetchone()
         self.deferred_sources = []
         since = time.time() - days * 86400 if days is not None else 0
         project_key = normalized_workspace(project) if project else None
@@ -245,6 +260,14 @@ class Engine:
                         self.deferred_sources.append((endpoint, considered[1], considered[2]))
                         continue
                     absolute = str(path.absolute())
+                    summarize = (use_summaries and not force and st and not hot(st) and ref.native_id not in duplicates
+                                 and type(adapter) is BUILTINS.get(adapter.installation.harness))
+                    if summarize:
+                        row = self.store.sync_summary(key, absolute, stamp, endpoint, ref.native_id)
+                        if row and (not has_legacy_targets or self.store.legacy_import_target(absolute) is None):
+                            if not project_key or normalize(row["workspace"]) == project_key:
+                                result.append(SyncSummary(key, endpoint, absolute, stamp, *row))
+                            continue
                     hint = self.store.workspace_hint(key, absolute, stamp) if st and not force else None
                     known = hint
                     if project_key and known is None and st and not force:
@@ -268,6 +291,7 @@ class Engine:
                             raise
                         cached = None
                         session = adapter.read(ref)
+                    has_workspace = bool(session.workspace)
                     explicit_unknown = ref.native_id in adapter.options.get("workspace_map", {}) and not adapter.options["workspace_map"][ref.native_id]
                     if not explicit_unknown:
                         session.workspace = session.workspace or self.store.workspace(endpoint, ref.native_id)
@@ -296,6 +320,11 @@ class Engine:
                         continue
                     self.stamps[session.key] = stamp
                     result.append(session)
+                    # These sessions can be reconstructed from the parse cache without
+                    # consulting a workspace guess, a binding, or a parent archive.
+                    if (summarize and has_workspace and session is raw_session and session.key == key
+                            and session.source_path == absolute and session.provenance.keys() <= {"user_title"}):
+                        _summary_sources[id(session)] = (absolute, json.dumps(stamp))
                 except (SyncError, OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
                     self.errors.append("{}: {}".format(ref.path, exc))
         keys = {s.key for s in result}
@@ -792,6 +821,19 @@ class Engine:
         self.store.db.commit()
         return revision
 
+    def load_sync_summary(self, summary):
+        """Materialize the exact snapshot selected during the scan."""
+        try:
+            document = self.store.cached(summary.key, summary.source_path, summary.stamp)
+            session = Session.from_dict(document)
+            session.issues = [issue for issue in session.issues if issue != WORKSPACE_UNKNOWN]
+            if session.key == summary.key and session.revision == summary.revision:
+                return session
+        except (SyncError, ValueError, TypeError, KeyError, RecursionError):
+            pass
+        self.store.forget_sync_summary(summary.key)
+        raise SyncError("cached transcript changed; retry on the next sync: " + summary.source_path)
+
     def sync(self, source=None, destination=None, project=None, days=30, budget=DEFAULT_BUDGET, fresh=None):
         """Hand off every in-scope session. fresh: keys of sessions a hook just reported,
         which are never deferred as still being written."""
@@ -806,7 +848,9 @@ class Engine:
             raise SyncError("unknown destination: " + destination)
         # A throttled source is skipped before it is parsed: reading a long session being
         # written costs as much as the snapshot it would not get.
-        sessions = self.scan(project, source, days, defer=(interval, fresh) if interval else None)
+        summary_sources, summaries = {}, []
+        sessions = self.scan(project, source, days, defer=(interval, fresh) if interval else None,
+                             _summary_sources=summary_sources)
         # One current source per project/destination prevents a context inbox from replaying old tasks.
         # A deferred source is still that workspace's newest conversation where it is newer
         # (both sides compare conversation times).
@@ -822,7 +866,11 @@ class Engine:
                     slot = (workspace_key, target.endpoint)
                     held[slot] = max(held.get(slot, 0), written)
         floor = min_free_bytes(self.config)
-        for session in sessions:
+        sessions.reverse()
+        while sessions:
+            session = sessions.pop()
+            summarized = isinstance(session, SyncSummary)
+            full_session = None if summarized else session
             if floor and not self.dry_run and free_bytes(self.directory) < floor:
                 self.errors.append("low disk space: under {:.1f} GB free at {}; skipped the remaining handoffs".format(
                     floor / 1e9, self.directory))
@@ -832,19 +880,23 @@ class Engine:
                 self.errors.append("{}: workspace unknown; skipped automatic handoff".format(session.key))
                 continue
             hot_stat = None
-            if interval and session.source_path:
+            if interval and session.source_path and not summarized:
                 try:
                     stat = Path(session.source_path).stat()
                 except OSError:
                     stat = None
                 hot_stat = stat if hot(stat) else None
             try:
-                revision = self.revision_of(session)
+                revision = session.revision if summarized else self.revision_of(session)
                 workspace_key = normalized_workspace(session.workspace)
-                updated = instant(session.updated).timestamp() if session.updated else 0
+                updated_text = session.updated
+                updated = instant(updated_text).timestamp() if updated_text else 0
             except (SyncError, ValueError, OverflowError) as exc:
                 self.errors.append("{}: {}".format(session.key, exc))
                 continue
+            if id(session) in summary_sources:
+                path, stamp = summary_sources[id(session)]
+                summaries.append((session.key, path, stamp, session.workspace, updated_text, revision))
             serialization, failed = {}, False
             for target in targets:
                 if source_endpoint == target.endpoint:
@@ -872,14 +924,18 @@ class Engine:
                         continue
                     if target.native_import and self.archived_earlier(session.key, target.endpoint, revision):
                         continue
-                    item, files = self.plan(session, target.endpoint, budget=route_budget, _revision=revision, _serialization=serialization)
-                    results.append(self.apply(item, files))
+                    if full_session is None:
+                        full_session = self.load_sync_summary(session)
+                    results.append(self.apply(*self.plan(full_session, target.endpoint, budget=route_budget,
+                                                         _revision=revision, _serialization=serialization)))
                 except (OSError, SyncError, ValueError) as exc:
                     self.errors.append("{} -> {}: {}".format(session.key, target.endpoint, exc))
                     failed = True
             if hot_stat is not None and not failed and not destination:
                 # Handled for every destination: not again (except by its own hook) until the interval passes.
                 self.considered(session, hot_stat)
+        if summaries:
+            self.store.save_sync_summaries(summaries)
         return results
 
     def incoming(self, destination, project, exclude_session=None, budget=None):

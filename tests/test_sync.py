@@ -19,6 +19,7 @@ from agent_session_sync.discovery import Installation, discover, executable_cand
 from agent_session_sync.engine import Engine
 from agent_session_sync.io import SyncError, atomic_write, digest, json_bytes, read_records
 from agent_session_sync.model import Event, Session, markdown, timestamp
+from agent_session_sync.render import injection_budget
 from agent_session_sync.store import single_flight
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -147,6 +148,52 @@ print(json.dumps(dict(protocol_version=1,**response)))
 
 
 class TransferTests(Workspace):
+    def test_sync_reuses_old_cache_as_summary_and_repairs_with_one_load(self):
+        engine = self.engine()
+        source = engine.scan(harness="codex", days=None)[0]
+        routes = [{"from": "codex", "to": target} for target in ("muse", "agy")]
+        engine.config["routes"] = routes
+        expected = {engine.transfer_id(source, target, False, injection_budget(self.adapters[target]))
+                    for target in ("muse", "agy")}
+        first = engine.sync(source="codex", days=None)
+        self.assertEqual({item["id"] for item in first}, expected)
+
+        reopened = self.engine(config={"routes": routes})
+        with mock.patch.object(reopened.store, "cached", wraps=reopened.store.cached) as cached:
+            self.assertEqual(reopened.sync(source="codex", days=None), [])
+            cached.assert_not_called()
+            for item in first:
+                Path(item["context"]).unlink()
+            repaired = reopened.sync(source="codex", days=None)
+            self.assertEqual({item["id"] for item in repaired}, expected)
+            cached.assert_called_once()
+        self.assertTrue(all(Path(item["context"]).is_file() for item in repaired))
+
+    def test_changed_source_replaces_its_summary_and_keeps_context_order(self):
+        engine = self.engine(config={"routes": [{"from": source, "to": "muse"} for source in ("codex", "claude")]})
+        baseline = engine.sync(destination="muse", days=None)
+        self.assertEqual(len(baseline), 1)
+        self.append(self.paths["codex"], {
+            "timestamp": "2026-10-16T12:00:00Z", "type": "response_item",
+            "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "New result."}]}
+        })
+        changed = engine.sync(destination="muse", days=None)
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0]["source_key"], self.read("codex").key)
+        self.assertNotEqual(changed[0]["id"], baseline[0]["id"])
+        with mock.patch.object(engine.store, "cached", side_effect=AssertionError("decoded an unchanged transcript")):
+            self.assertEqual(engine.sync(destination="muse", days=None), [])
+
+    def test_new_binding_bypasses_a_previous_summary(self):
+        engine = self.engine()
+        first, = engine.sync(source="muse", destination="claude", days=None)
+        parent = engine.handoff(self.read("codex"), "muse", mode="context")
+        engine.store.db.execute("INSERT INTO metadata VALUES (?, ?)", ("binding:muse:" + IDS["muse"], parent["id"]))
+        engine.store.db.commit()
+        linked, = engine.sync(source="muse", destination="claude", days=None)
+        self.assertNotEqual(first["id"], linked["id"])
+        self.assertEqual(engine.select(IDS["muse"]).parent, parent["source_key"] + "@" + parent["source_revision"])
+
     def test_route_restrictions_apply_to_automatic_startup_handoffs(self):
         engine = self.engine()
         engine.config = {"routes": []}
