@@ -270,6 +270,10 @@ parsed; completed transfers repair missing generated artifacts. A transcript tha
 grows while it is read is read up to its size at open, since JSONL histories are
 append-only.
 
+Native JSON and JSONL transcript reads are limited to 256 MiB, including after
+decompressing a Codex rollout. A scan reports an oversized transcript by path
+and continues with other sessions. The harness's original file stays in place.
+
 A transcript of 32 MB or more that changed in the last two minutes is still being
 written. Its full document isn't cached, because it would be stale within seconds.
 Such a session is also snapshotted at most once per `hot_handoff_minutes` (default

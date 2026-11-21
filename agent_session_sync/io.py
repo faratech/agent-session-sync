@@ -17,6 +17,7 @@ class SyncError(Exception):
     pass
 
 
+MAX_TRANSCRIPT_BYTES = 256 << 20
 SURROGATE_ESCAPE = re.compile(r"\\u[dD][89a-fA-F]")
 LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
@@ -178,12 +179,22 @@ def read_records(path):
     when the same file has not shrunk. A single-document .json must be unchanged.
     """
     path = Path(path)
-    with path.open("rb") as stream:
+    suffix = path.suffix.lower()
+    with path.open("rb", buffering=0) as stream:
         before = os.fstat(stream.fileno())
-        raw = stream.read(before.st_size)
+        if before.st_size > MAX_TRANSCRIPT_BYTES:
+            raise transcript_too_large(path, MAX_TRANSCRIPT_BYTES)
+        if suffix == ".zst":
+            declared = frame_content_size(stream.read(18))
+            if declared is not None and declared > MAX_TRANSCRIPT_BYTES:
+                raise transcript_too_large(path, MAX_TRANSCRIPT_BYTES)
+            stream.seek(0)
+            raw = read_zstd(path, stream, MAX_TRANSCRIPT_BYTES)
+        else:
+            raw = stream.read(before.st_size)
     after = path.stat()
     same = (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
-    if path.suffix.lower() in (".json", ".zst"):
+    if suffix in (".json", ".zst"):
         consistent = same and (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
     else:
         # Only growth is an append. An unchanged size with a new mtime is an in-place rewrite,
@@ -193,10 +204,7 @@ def read_records(path):
     if not consistent:
         raise SyncError("transcript changed while reading; retry: {}".format(path))
     issues = []
-    if path.suffix.lower() == ".zst":
-        # Codex compresses cold rollouts; the whole file is one zstd frame of JSONL.
-        raw = zstd_decompress(path, raw)
-    if path.suffix.lower() == ".json":
+    if suffix == ".json":
         try:
             text = raw.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
@@ -278,9 +286,12 @@ def zstd_content_size(path):
     """The decompressed size the first frame header of a .zst file declares, or None."""
     try:
         with open(str(path), "rb") as handle:
-            head = handle.read(18)
+            return frame_content_size(handle.read(18))
     except OSError:
         return None
+
+
+def frame_content_size(head):
     if len(head) < 6 or head[:4] != ZSTD_MAGIC:
         return None
     descriptor = head[4]
@@ -324,6 +335,96 @@ def find_program(name):
 
 
 _ZSTD = []
+
+
+def transcript_too_large(path, limit):
+    return SyncError("transcript exceeds the {:g} MiB read limit: {}".format(limit / (1 << 20), path))
+
+
+def read_zstd(path, stream, limit):
+    """Decode at most limit bytes, including across frames with no declared size."""
+    try:
+        from compression import zstd
+    except ImportError:
+        zstd = None
+    if zstd is not None:
+        try:
+            with zstd.ZstdFile(stream) as decoded:
+                data = decoded.read(limit + 1)
+        except (zstd.ZstdError, EOFError, OSError) as exc:
+            raise SyncError("cannot decompress {}: {}".format(path, exc))
+        if len(data) > limit:
+            raise transcript_too_large(path, limit)
+        if stream.tell() == 0:
+            raise SyncError("cannot decompress {}: empty file".format(path))
+        return data
+    try:
+        import zstandard
+    except ImportError:
+        return read_zstd_command(path, stream, limit)
+
+    # stream_reader can accept a truncated final frame. decompressobj exposes EOF
+    # but has no output limit. At most 1 KiB of input limits the output of even
+    # a run of 4-byte RLE blocks to about 32 MiB per call.
+    data = bytearray()
+    try:
+        decompressor = zstandard.ZstdDecompressor()
+        decoder = decompressor.decompressobj()
+        if not hasattr(decoder, "eof"):
+            # Older releases could only report one frame. Keep that behavior
+            # using their bounded streaming interface.
+            for chunk in decompressor.read_to_iter(stream):
+                if len(data) + len(chunk) > limit:
+                    raise transcript_too_large(path, limit)
+                data.extend(chunk)
+            return data
+        for block in iter(lambda: stream.read(1024), b""):
+            while block:
+                if decoder.eof:
+                    decoder = decompressor.decompressobj()
+                chunk = decoder.decompress(block)
+                if len(data) + len(chunk) > limit:
+                    raise transcript_too_large(path, limit)
+                data.extend(chunk)
+                block = decoder.unused_data
+    except zstandard.ZstdError as exc:
+        raise SyncError("cannot decompress {}: {}".format(path, exc))
+    if not decoder.eof:
+        raise SyncError("cannot decompress {}: empty or truncated file".format(path))
+    return data
+
+
+def read_zstd_command(path, stream, limit):
+    command = find_program("zstd")
+    if command is None:
+        raise SyncError("reading compressed {} needs Python 3.14, the zstandard package, or the zstd command".format(path))
+    import subprocess
+    from threading import Timer
+
+    # Input is already a file. A separate stderr file lets us read bounded stdout
+    # without waiting for a feeder thread or filling either process pipe.
+    with tempfile.TemporaryFile() as errors:
+        try:
+            with subprocess.Popen([command, "-dc"], stdin=stream, stdout=subprocess.PIPE, stderr=errors,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as process:
+                timer = Timer(300, process.kill)
+                timer.start()
+                try:
+                    data = process.stdout.read(limit + 1)
+                    if len(data) > limit:
+                        raise transcript_too_large(path, limit)
+                    status = process.wait()
+                finally:
+                    timer.cancel()
+                    if process.poll() is None:
+                        process.kill()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SyncError("cannot decompress {}: {}".format(path, exc))
+        if status:
+            errors.seek(0)
+            detail = errors.read(4096).decode("utf-8", "replace").strip()
+            raise SyncError("cannot decompress {}: {}".format(path, detail or "zstd exited with status " + str(status)))
+    return data
 
 
 def zstd_available():

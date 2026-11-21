@@ -12,7 +12,7 @@ from unittest import mock
 
 from test_sync import IDS, Workspace
 from test_review_round import CliWorkspace, settle
-from test_review_round2 import compress
+from test_review_round2 import compress, zstd_compress
 from agent_session_sync import cli
 from agent_session_sync import engine as engine_module
 from agent_session_sync import io as io_module
@@ -125,6 +125,41 @@ class CompressedCacheNeedsTheSameLength(Workspace):
         path.write_bytes(b"x" * 1000)
         self.assertEqual(zstd_content_size(compress(path)), 1000)
         self.assertIsNone(zstd_content_size(self.paths["claude"]))
+
+
+class TranscriptReadLimit(Workspace):
+    def test_scan_continues_after_an_oversized_plain_transcript(self):
+        path = self.paths["codex"]
+        limit = max(p.stat().st_size for p in self.paths.values())
+        with path.open("ab") as handle:
+            handle.truncate(limit + 1)
+        engine = self.engine()
+        with mock.patch.object(io_module, "MAX_TRANSCRIPT_BYTES", limit):
+            sessions = engine.scan(days=None)
+        self.assertNotIn("codex", {session.harness for session in sessions})
+        self.assertIn("claude", {session.harness for session in sessions})
+        self.assertTrue(any("read limit" in error and str(path) in error for error in engine.errors))
+        self.assertEqual(path.stat().st_size, limit + 1)
+
+    def test_oversized_declared_frame_is_rejected_before_decoding(self):
+        path = self.base / "large.jsonl.zst"
+        path.write_bytes(zstd_compress(b" " * 8192))
+        with mock.patch.object(io_module, "MAX_TRANSCRIPT_BYTES", 4096), \
+                mock.patch.object(io_module, "read_zstd", side_effect=AssertionError("opened for decompression")):
+            with self.assertRaisesRegex(SyncError, "read limit"):
+                read_records(path)
+
+    def test_compressed_limit_applies_to_the_sum_of_all_frames(self):
+        path = self.base / "frames.jsonl.zst"
+        frame = zstd_compress(b"{}" + b" " * 4093 + b"\n")
+        path.write_bytes(frame * 2)
+        with mock.patch.object(io_module, "MAX_TRANSCRIPT_BYTES", 8192):
+            records, issues, _ = read_records(path)
+            self.assertEqual(records, [{}, {}])
+            self.assertEqual(issues, [])
+        with mock.patch.object(io_module, "MAX_TRANSCRIPT_BYTES", 8191):
+            with self.assertRaisesRegex(SyncError, "read limit"):
+                read_records(path)
 
 
 class SubagentRolloutsReadOneRecord(Workspace):
