@@ -120,14 +120,29 @@ class WindowsInheritanceTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 for relative in ("current", "current/agent-session-sync.py", "current/agent_session_sync/cli.py"):
                     path = prefix / relative
-                    script = ("$a=Get-Acl -LiteralPath $env:ACL_TEST_PATH; "
-                              "$r=$a.Access | Where-Object { $_.IsInherited -and "
-                              "$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq 'S-1-1-0' }; "
-                              "if (-not $r) { exit 1 }")
+                    # Read the DACL through .NET so the check does not depend on
+                    # Windows PowerShell being able to load its Security module.
+                    script = """
+$ErrorActionPreference = 'Stop'
+$path = $env:ACL_TEST_PATH
+$access = [System.Security.AccessControl.AccessControlSections]::Access
+if ([System.IO.Directory]::Exists($path)) {
+    $acl = [System.IO.Directory]::GetAccessControl($path, $access)
+} else {
+    $acl = [System.IO.File]::GetAccessControl($path, $access)
+}
+$readExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+foreach ($rule in $acl.GetAccessRules($false, $true, [System.Security.Principal.SecurityIdentifier])) {
+    if ($rule.IdentityReference.Value -eq 'S-1-1-0' -and $rule.AccessControlType -eq 'Allow' -and
+        ($rule.FileSystemRights -band $readExecute) -eq $readExecute) {
+        exit 0
+    }
+}
+throw "Expected inherited Everyone read and execute permissions on $path"
+"""
                     env = dict(os.environ, ACL_TEST_PATH=str(path))
-                    env["PSModulePath"] = str(Path(os.environ["WINDIR"]) / "System32/WindowsPowerShell/v1.0/Modules")
                     check = subprocess.run(["powershell.exe", "-NoProfile", "-Command", script],
-                                           env=env, capture_output=True, text=True)
+                                           env=env, capture_output=True, text=True, timeout=30)
                     self.assertEqual(check.returncode, 0, str(path) + check.stdout + check.stderr)
 
 
